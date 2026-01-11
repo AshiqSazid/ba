@@ -1,0 +1,50 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+env/
+backendenv/
+.venv/
+
+# Environment variables / secrets
+*.env
+*.env.*
+.envrc
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
+# PyInstaller
+*.spec
+
+# Logs and runtime files
+*.log
+*.pid
+*.gz
+
+# IDE/editor stuff
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Cache
+*.cache/
+.cache/
+pip-wheel-metadata/
+
+# Python tooling
+.mypy_cache/
+.pytest_cache/
+coverage.xml
+htmlcov/

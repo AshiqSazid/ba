@@ -1,0 +1,4056 @@
+from __future__ import annotations
+
+import csv
+import os
+import math
+import hashlib
+from typing import List, Dict, Optional, Tuple, Callable, Set, Any
+from datetime import datetime, timedelta, date
+import json
+
+
+print("ml")
+import numpy as np
+from collections import defaultdict
+import pickle
+import mysql.connector
+from pathlib import Path
+import time
+import random
+import re
+import argparse
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+
+def make_json_safe(obj: Any):
+    if isinstance(obj, dict):
+        return {key: make_json_safe(value) for key, value in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [make_json_safe(item) for item in obj]
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, np.generic):
+        return obj.item()
+    return obj
+
+try:
+    from db_config import connect_to_mysql, MYSQL_DATABASE
+except ModuleNotFoundError:  # pragma: no cover - fallback when imported as package
+    try:
+        from backend.db_config import connect_to_mysql, MYSQL_DATABASE
+    except ModuleNotFoundError:
+        # Provide default implementations if module cannot be found
+        def connect_to_mysql(database: str = None):
+            """Fallback MySQL connection function"""
+            import mysql.connector
+            return mysql.connector.connect(
+                host=os.getenv("MYSQL_HOST", "localhost"),
+                user=os.getenv("MYSQL_USER", "root"),
+                password=os.getenv("MYSQL_PASSWORD", ""),
+                database=database or os.getenv("MYSQL_DATABASE", "theramuse")
+            )
+        
+        MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "theramuse")
+
+class LocalMusicDataset:
+    """
+    Offline music catalogue that loads rows from a curated CSV file and enables
+    fuzzy matching against song titles, singers, languages, and genres.
+    """
+
+    AUDIO_FEATURE_FIELDS = {
+        "danceability": "danceability",
+        "acousticness": "acousticness",
+        "energy": "energy",
+        "liveness": "liveness",
+        "loudness": "loudness",
+        "speechiness": "speechiness",
+        "tempo": "tempo",
+    }
+
+    PERSONALITY_FIELDS: Dict[str, Tuple[str, ...]] = {
+        "openness": ("openness", "Openness"),
+        "conscientiousness": ("conscientiousness", "Conscientiousness"),
+        "extraversion": ("extraversion", "Extraversion"),
+        "agreeableness": ("agreeableness", "Agreeableness"),
+        "neuroticism": ("neuroticism", "Neuroticism"),
+    }
+
+    def __init__(self, csv_path: Optional[str] = None):
+        self.csv_path = Path(
+            csv_path
+            or os.getenv(
+                "LOCAL_MUSIC_CSV_PATH",
+                "/home/spectre-rosamund/CVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV/d.csv",
+            )
+        ).expanduser()
+        self._catalog: List[Dict[str, Any]] = []
+        self._load_catalog()
+
+    def _parse_release_date(self, raw_value: str) -> Optional[str]:
+        raw_value = (raw_value or "").strip()
+        if not raw_value:
+            return None
+
+        formats = [
+            "%Y-%m-%d",
+            "%m/%d/%Y",
+            "%d/%m/%Y",
+            "%Y/%m/%d",
+            "%d-%m-%Y",
+            "%Y",
+        ]
+        for fmt in formats:
+            try:
+                parsed = datetime.strptime(raw_value, fmt)
+                if fmt == "%Y":
+                    return f"{parsed.year}-01-01"
+                return parsed.strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+
+        digits_only = "".join(ch for ch in raw_value if ch.isdigit())
+        if len(digits_only) == 4:
+            return f"{digits_only}-01-01"
+        return None
+
+    def _parse_duration_ms(self, raw_value: str) -> Optional[int]:
+        raw_value = (raw_value or "").strip()
+        if not raw_value:
+            return None
+        if raw_value.isdigit():
+            seconds = int(raw_value)
+            return seconds * 1000
+
+        parts = raw_value.split(":")
+        if all(part.isdigit() for part in parts):
+            parts = [int(part) for part in parts]
+            if len(parts) == 3:
+                hours, minutes, seconds = parts
+                total_seconds = hours * 3600 + minutes * 60 + seconds
+                return total_seconds * 1000
+            if len(parts) == 2:
+                minutes, seconds = parts
+                total_seconds = minutes * 60 + seconds
+                return total_seconds * 1000
+        return None
+
+    def _parse_float_value(self, value: Optional[str]) -> Optional[float]:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        text = text.replace("%", "")
+        try:
+            return float(text)
+        except ValueError:
+            return None
+
+    def _extract_audio_features(self, row: Dict[str, Any]) -> Dict[str, float]:
+        features: Dict[str, float] = {}
+        for feature_key, column in self.AUDIO_FEATURE_FIELDS.items():
+            raw_value = row.get(column)
+            numeric = self._parse_float_value(raw_value)
+            if numeric is None:
+                continue
+            if feature_key in {"danceability", "acousticness", "energy", "liveness", "speechiness"}:
+                numeric = max(0.0, min(1.0, numeric))
+            features[feature_key] = numeric
+        return features
+
+    def _extract_personality_vector(self, row: Dict[str, Any]) -> Optional[Dict[str, float]]:
+        vector: Dict[str, float] = {}
+        for trait, columns in self.PERSONALITY_FIELDS.items():
+            value: Optional[float] = None
+            for column in columns:
+                if column in row and row[column] not in (None, ""):
+                    numeric = self._parse_float_value(row[column])
+                    if numeric is not None:
+                        value = numeric
+                        break
+            if value is not None:
+                vector[trait] = value
+        return vector or None
+
+    def _build_track_record(self, row: Dict[str, str]) -> Optional[Dict[str, Any]]:
+        normalized_row = {
+            key: (value.strip() if isinstance(value, str) else value)
+            for key, value in row.items()
+        }
+
+        song_name = (normalized_row.get("song_name") or "").strip()
+        singer = (normalized_row.get("singer") or "").strip() or "Unknown Artist"
+        if not song_name:
+            return None
+
+        release_value = self._parse_release_date(normalized_row.get("released_date") or "")
+        duration_ms = self._parse_duration_ms(normalized_row.get("duration") or "")
+        genre = (normalized_row.get("genre") or "").strip()
+        language = (normalized_row.get("language") or "").strip()
+
+        track_id = f"local::{hash((song_name.lower(), singer.lower(), release_value or ''))}"
+
+        audio_features = self._extract_audio_features(normalized_row)
+        personality_vector = self._extract_personality_vector(normalized_row)
+
+        track = {
+            "id": track_id,
+            "title": song_name,
+            "name": song_name,
+            "url": f"https://theramuse.local/{track_id}",
+            "artists": [singer],
+            "artist": singer,
+            "album": genre or "Local Catalogue",
+            "duration_ms": duration_ms,
+            "duration": duration_ms,
+            "language": language,
+            "genre": genre,
+            "popularity": 50,
+            "explicit": False,
+            "metadata": {
+                "release_value": release_value,
+                "source": "local_csv_catalog",
+                "csv_row": normalized_row,
+                "audio_features": audio_features,
+                "personality_vector": personality_vector,
+            },
+        }
+
+        searchable_text = " ".join(
+            filter(
+                None,
+                [
+                    song_name.lower(),
+                    singer.lower(),
+                    genre.lower() if genre else "",
+                    language.lower() if language else "",
+                ],
+            )
+        )
+
+        return {
+            "track": track,
+            "search_text": searchable_text,
+        }
+
+    def _load_catalog(self) -> None:
+        if not self.csv_path.exists():
+            print(f"ℹ️  Local music CSV not found at {self.csv_path}")
+            self._catalog = []
+            return
+
+        catalog: List[Dict[str, Any]] = []
+        seen_ids: Set[str] = set()
+
+        try:
+            with self.csv_path.open(newline="", encoding="utf-8") as handle:
+                reader = csv.DictReader(handle)
+                for row in reader:
+                    record = self._build_track_record(row)
+                    if not record:
+                        continue
+                    track_id = record["track"]["id"]
+                    if track_id in seen_ids:
+                        continue
+                    seen_ids.add(track_id)
+                    catalog.append(record)
+
+            print(f"ℹ️  Loaded {len(catalog)} songs from {self.csv_path}")
+        except Exception as exc:
+            print(f"⚠️  Failed to load local music CSV: {exc}")
+            catalog = []
+
+        self._catalog = catalog
+
+    def search_tracks(self, query: str, max_results: int = 20) -> List[Dict]:
+        if not query:
+            return []
+        query_lower = query.lower()
+        terms = [term for term in re.split(r"\s+", query_lower) if term]
+
+        if not self._catalog:
+            return []
+
+        matches: List[Tuple[int, Dict[str, Any]]] = []
+        for record in self._catalog:
+            text = record["search_text"]
+            score = 0
+            if query_lower in text:
+                score += 5
+            for term in terms:
+                if term in text:
+                    score += 1
+            if score > 0:
+                matches.append((score, record["track"]))
+
+        if not matches:
+            # fallback: return first N songs for deterministic behavior
+            return [record["track"] for record in self._catalog[:max_results]]
+
+        matches.sort(key=lambda item: item[0], reverse=True)
+        return [track for _, track in matches[:max_results]]
+
+    def _normalise_preference_values(self, raw_value: Any) -> List[str]:
+        values: List[str] = []
+        if isinstance(raw_value, list):
+            for item in raw_value:
+                if isinstance(item, str):
+                    cleaned = item.strip()
+                    if cleaned:
+                        values.append(cleaned)
+        elif isinstance(raw_value, str):
+            parts = [raw_value]
+            if "," in raw_value:
+                parts = raw_value.split(",")
+            for part in parts:
+                cleaned = part.strip()
+                if cleaned:
+                    values.append(cleaned)
+        return values
+
+    def _split_csv_list(self, raw_value: Optional[str]) -> List[str]:
+        if not raw_value:
+            return []
+        return [segment.strip() for segment in raw_value.split(",") if segment.strip()]
+
+    def search_by_patient_preferences(self, patient_info: Dict[str, Any], max_results: int = 8) -> List[Dict[str, Any]]:
+        if not patient_info or not self._catalog:
+            return []
+
+        favorite_genre_input = patient_info.get("favorite_genre") or patient_info.get("favoriteGenres")
+        favorite_genres = self._normalise_preference_values(favorite_genre_input)
+        instrument_preferences = self._normalise_preference_values(patient_info.get("instruments"))
+        preferred_languages = self._normalise_preference_values(
+            patient_info.get("preferred_languages") or patient_info.get("preferredLanguages")
+        )
+        favorite_musician = (patient_info.get("favorite_musician") or "").strip().lower()
+
+        has_preferences = any([favorite_genres, instrument_preferences, preferred_languages, favorite_musician])
+        if not has_preferences:
+            return []
+
+        genre_terms = [genre.lower() for genre in favorite_genres]
+        instrument_terms = {instrument.lower() for instrument in instrument_preferences}
+        language_terms = [language.lower() for language in preferred_languages]
+
+        matches: List[Tuple[int, Dict[str, Any]]] = []
+        for record in self._catalog:
+            track = record["track"]
+            metadata = track.get("metadata", {}) or {}
+            csv_row = metadata.get("csv_row") or {}
+
+            score = 0
+            matched_instruments: List[str] = []
+            matched_genre: Optional[str] = None
+            matched_language: Optional[str] = None
+
+            track_genre = (csv_row.get("genre") or track.get("genre") or "").lower()
+            if genre_terms and track_genre:
+                for genre in genre_terms:
+                    if genre and genre in track_genre:
+                        score += 4
+                        matched_genre = genre
+                        break
+
+            csv_instruments = self._split_csv_list(csv_row.get("used instruments in the song"))
+            if instrument_terms and csv_instruments:
+                for instrument in csv_instruments:
+                    if instrument.lower() in instrument_terms:
+                        matched_instruments.append(instrument)
+                if matched_instruments:
+                    score += 3 * len(matched_instruments)
+
+            track_language = (csv_row.get("language") or "").lower()
+            if language_terms and track_language:
+                for language in language_terms:
+                    if language and language in track_language:
+                        score += 2
+                        matched_language = language
+                        break
+
+            artist_name = (track.get("artist") or "").lower()
+            if favorite_musician and artist_name and favorite_musician in artist_name:
+                score += 3
+
+            if score <= 0:
+                continue
+
+            description_parts: List[str] = []
+            if csv_row.get("genre"):
+                description_parts.append(csv_row["genre"])
+            if csv_row.get("language"):
+                description_parts.append(csv_row["language"])
+            if matched_instruments:
+                description_parts.append(", ".join(matched_instruments))
+
+            match_payload = {
+                "id": track.get("id"),
+                "title": track.get("title"),
+                "url": track.get("url"),
+                "artist": track.get("artist"),
+                "channel": "Local CSV Catalogue",
+                "description": " • ".join(description_parts) if description_parts else None,
+                "metadata": {
+                    "genre": csv_row.get("genre"),
+                    "language": csv_row.get("language"),
+                    "instruments": csv_instruments,
+                    "release_value": metadata.get("release_value"),
+                    "match_score": score,
+                    "matched_genre": matched_genre,
+                    "matched_instruments": matched_instruments,
+                    "matched_language": matched_language,
+                },
+                "source": "local_csv_preferences",
+            }
+            matches.append((score, match_payload))
+
+        if not matches:
+            return []
+
+        matches.sort(
+            key=lambda item: (
+                item[0],
+                (item[1].get("metadata", {}).get("release_value") or ""),
+            ),
+            reverse=True,
+        )
+
+        return [payload for _, payload in matches[:max_results]]
+
+    def _score_audio_preferences(
+        self,
+        audio_features: Dict[str, float],
+        trait_filters: Optional[List[Dict[str, Any]]],
+    ) -> float:
+        if not audio_features or not trait_filters:
+            return 0.0
+
+        total_score = 0.0
+        for entry in trait_filters:
+            for preference in entry.get("audio_preferences") or []:
+                key = preference.get("key")
+                if not key:
+                    continue
+                value = audio_features.get(key)
+                if value is None:
+                    continue
+
+                weight = float(preference.get("weight", 1.0))
+                min_val = preference.get("min")
+                max_val = preference.get("max")
+                target = preference.get("target")
+                tolerance = float(preference.get("tolerance", 0.1))
+
+                if target is not None:
+                    diff = abs(value - target)
+                    contribution = weight * max(0.0, 1 - diff / max(tolerance, 1e-6))
+                    total_score += contribution
+                    continue
+
+                satisfied = True
+                if min_val is not None and value < min_val:
+                    satisfied = False
+                if max_val is not None and value > max_val:
+                    satisfied = False
+
+                if satisfied:
+                    total_score += weight
+                else:
+                    total_score -= weight * 0.5
+
+        return total_score
+
+    def search_by_genres(
+        self,
+        genres: List[str],
+        max_results: int = 10,
+        trait_filters: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        if not genres or not self._catalog:
+            return []
+
+        normalized_terms: List[str] = []
+        for genre in genres:
+            if not isinstance(genre, str):
+                continue
+            cleaned = genre.strip().lower()
+            if not cleaned:
+                continue
+            if cleaned not in normalized_terms:
+                normalized_terms.append(cleaned)
+            for fragment in re.split(r'[^a-z0-9]+', cleaned):
+                fragment = fragment.strip()
+                if fragment and fragment not in normalized_terms:
+                    normalized_terms.append(fragment)
+
+        if not normalized_terms:
+            return []
+
+        matches: List[Tuple[float, Dict[str, Any]]] = []
+        seen_ids: Set[str] = set()
+
+        for record in self._catalog:
+            track = record["track"]
+            metadata = track.get("metadata", {}) or {}
+            csv_row = metadata.get("csv_row") or {}
+            audio_features = metadata.get("audio_features") or self._extract_audio_features(csv_row)
+            track_genre = (csv_row.get("genre") or track.get("genre") or "").lower()
+            if not track_genre:
+                continue
+
+            score: float = 0.0
+            matched_terms: List[str] = []
+
+            for term in normalized_terms:
+                if term and term in track_genre:
+                    matched_terms.append(term)
+                    score += 4 if " " in term else 2
+
+            if score <= 0:
+                continue
+
+            score += self._score_audio_preferences(audio_features, trait_filters)
+
+            track_id = track.get("id") or track.get("title")
+            if track_id in seen_ids:
+                continue
+            seen_ids.add(track_id)
+
+            description_parts: List[str] = []
+            if csv_row.get("genre"):
+                description_parts.append(csv_row["genre"])
+            if csv_row.get("language"):
+                description_parts.append(csv_row["language"])
+
+            matches.append(
+                (
+                    score,
+                    {
+                        "id": track.get("id"),
+                        "title": track.get("title"),
+                        "url": track.get("url"),
+                        "artist": track.get("artist"),
+                        "channel": "Local CSV Catalogue",
+                        "description": " • ".join(description_parts) if description_parts else None,
+                        "metadata": {
+                            "genre": csv_row.get("genre"),
+                            "language": csv_row.get("language"),
+                            "instruments": self._split_csv_list(csv_row.get("used instruments in the song")),
+                            "release_value": metadata.get("release_value"),
+                            "matched_terms": matched_terms,
+                            "match_score": score,
+                            "audio_features": audio_features,
+                        },
+                        "source": "local_csv_personality",
+                    },
+                )
+            )
+
+        if not matches:
+            return []
+
+        matches.sort(key=lambda item: (item[0], item[1]["metadata"].get("release_value") or ""), reverse=True)
+        return [payload for _, payload in matches[:max_results]]
+
+    def search_by_personality(
+        self,
+        target_scores: Dict[str, float],
+        max_results: int = 10,
+        exclude_ids: Optional[Set[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        if not target_scores or not self._catalog:
+            return []
+
+        trait_order = ("openness", "conscientiousness", "extraversion", "agreeableness", "neuroticism")
+        exclude_lookup = {str(item) for item in (exclude_ids or set()) if item}
+        matches: List[Tuple[float, Dict[str, Any]]] = []
+        seen_ids: Set[str] = set()
+
+        for record in self._catalog:
+            track = record["track"]
+            metadata = track.get("metadata", {}) or {}
+            vector = metadata.get("personality_vector")
+            if not vector:
+                continue
+
+            comparisons: List[Tuple[str, float]] = []
+            for trait in trait_order:
+                target_value = target_scores.get(trait)
+                vector_value = vector.get(trait) if isinstance(vector, dict) else None
+                if target_value is not None and vector_value is not None:
+                    delta = float(target_value) - float(vector_value)
+                    comparisons.append((trait, delta))
+
+            if len(comparisons) < 3:
+                continue
+
+            distance = math.sqrt(sum(delta * delta for _, delta in comparisons) / len(comparisons))
+            dominant_trait = min(comparisons, key=lambda item: abs(item[1]))[0]
+
+            track_id = str(track.get("id") or track.get("title") or f"csv::{len(matches)}")
+            if track_id in exclude_lookup or track_id in seen_ids:
+                continue
+            seen_ids.add(track_id)
+
+            csv_row = metadata.get("csv_row") or {}
+            description_parts: List[str] = []
+            if csv_row.get("genre"):
+                description_parts.append(csv_row["genre"])
+            if csv_row.get("language"):
+                description_parts.append(csv_row["language"])
+
+            match_payload = {
+                "id": track.get("id"),
+                "title": track.get("title"),
+                "url": track.get("url"),
+                "artist": track.get("artist"),
+                "channel": "Local CSV Catalogue",
+                "description": " • ".join(description_parts) if description_parts else None,
+                "metadata": {
+                    "personality_distance": distance,
+                    "personality_trait": dominant_trait,
+                    "personality_vector": vector,
+                    "genre": csv_row.get("genre"),
+                    "language": csv_row.get("language"),
+                },
+                "source": "local_csv_personality",
+            }
+            matches.append((distance, match_payload))
+
+        if not matches:
+            return []
+
+        matches.sort(key=lambda item: item[0])
+        return [payload for _, payload in matches[:max_results]]
+
+    def get_api_health_status(self) -> Dict[str, Any]:
+        return {
+            "service": "LocalMusicDataset",
+            "csv_path": str(self.csv_path),
+            "catalog_size": len(self._catalog),
+        }
+
+
+class MusicSearchService:
+
+
+    def __init__(self, fetcher: Optional[Callable[[str, int], List[Dict]]] = None):
+        self._provider: Optional[LocalMusicDataset] = None
+
+        if fetcher is None:
+            provider = LocalMusicDataset()
+            self._provider = provider
+            fetcher = provider.search_tracks
+
+        self.fetcher = fetcher
+        self._song_cache: Set[str] = set()
+        self._query_history: Dict[str, int] = {}
+        if self.fetcher:
+            if self._provider:
+                print("🎵 Music search service initialized with local dataset provider")
+            else:
+                print("🎵 Music search service initialized with custom provider")
+        else:
+            print("🎵 Music search service running in placeholder mode (no external provider configured)")
+
+    def _vary_query(self, base_query: str) -> str:
+
+        if base_query not in self._query_history:
+            self._query_history[base_query] = 0
+        self._query_history[base_query] += 1
+        usage_count = self._query_history[base_query]
+
+        query_lower = base_query.lower()
+        has_song = " song" in query_lower or query_lower.endswith(" song")
+        has_music = " music" in query_lower or query_lower.endswith(" music")
+
+        if has_song or has_music:
+            variations = [
+                base_query,
+                f"{base_query} official",
+                f"{base_query} album",
+                f"{base_query} single",
+                f"{base_query} track"
+            ]
+        else:
+            variations = [
+                f"{base_query} song",
+                f"{base_query} music",
+                f"{base_query} official",
+                f"{base_query} album",
+                f"{base_query} single"
+            ]
+
+        variation_index = (usage_count - 1) % len(variations)
+        return variations[variation_index]
+
+    def _is_valid_music_result(self, track: Dict) -> bool:
+
+        if not track:
+            return False
+
+        name = track.get('name') or track.get('title') or ''
+        if not name:
+            return False
+
+        duration_ms = track.get('duration_ms')
+        if duration_ms and 0 < duration_ms < 30000:
+            return False
+
+        return True
+
+    def _normalize_track(self, track: Dict) -> Dict:
+
+        if not track:
+            return {}
+
+        artist_names = track.get('artists') or track.get('artist') or []
+        if isinstance(artist_names, str):
+            artist_names = [artist_names]
+
+        if artist_names:
+            primary_artist = artist_names[0]
+        else:
+            primary_artist = track.get('primary_artist', 'Unknown Artist')
+
+        album = track.get('album') or {}
+        if isinstance(album, str):
+            album_name = album
+            album_images = []
+        else:
+            album_name = album.get('name', 'Unknown Album')
+            album_images = album.get('images', [])
+
+        image_url = ''
+        if isinstance(album_images, list) and album_images:
+            first_image = album_images[0]
+            if isinstance(first_image, dict):
+                image_url = first_image.get('url', '')
+            elif isinstance(first_image, str):
+                image_url = first_image
+
+        return {
+            'id': track.get('id', ''),
+            'title': track.get('title') or track.get('name', ''),
+            'url': track.get('url', ''),
+            'artist': primary_artist,
+            'artists': artist_names,
+            'album': album_name,
+            'duration_ms': track.get('duration_ms', 0),
+            'duration': track.get('duration', 0),
+            'preview_url': track.get('preview_url', ''),
+            'image_url': image_url,
+            'popularity': track.get('popularity', 0),
+            'explicit': track.get('explicit', False)
+        }
+
+    def search_music(self, query: str, max_results: int = 50, max_retries: int = 3) -> List[Dict]:
+
+
+        varied_query = self._vary_query(query)
+
+        if not self.fetcher:
+            print(f" Music search placeholder: '{query}' → '{varied_query}' | No provider configured.")
+            return []
+
+        for attempt in range(max_retries):
+            try:
+                print(f" Query '{query}' → '{varied_query}' | Searching music provider (limit={max_results})")
+                tracks = self.fetcher(varied_query, max_results) or []
+
+                valid_tracks = []
+                seen_track_ids: Set[str] = set()
+
+                for track in tracks:
+                    track_id = track.get('id')
+
+                    if not track_id or track_id in self._song_cache or track_id in seen_track_ids:
+                        continue
+
+                    if not self._is_valid_music_result(track):
+                        continue
+
+                    normalized = self._normalize_track(track)
+                    if normalized.get('id'):
+                        valid_tracks.append(normalized)
+                        seen_track_ids.add(normalized['id'])
+                        self._song_cache.add(normalized['id'])
+
+                print(f" Fetched {len(tracks)} tracks | Valid tracks {len(valid_tracks)}")
+
+                if valid_tracks:
+                    return valid_tracks
+
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+
+            except Exception as exc:
+                print(f"Attempt {attempt + 1} failed: {exc}")
+                if attempt < max_retries - 1:
+                    time.sleep(2)
+                    continue
+
+        return []
+
+    def get_track_metadata(
+        self,
+        song_title: str,
+        artist_name: Optional[str] = None,
+        max_results: int = 3
+    ) -> Optional[Dict]:
+
+        if not song_title:
+            return None
+
+        title = song_title.strip()
+        artist = artist_name.strip() if artist_name else ""
+        queries = []
+
+        if title and artist:
+            queries.append(f'{title} {artist}')
+        if title:
+            queries.append(title)
+
+        seen_keys: Set[str] = set()
+
+        provider_fetcher = self._provider.search_tracks if self._provider else None
+
+        for query in queries:
+            if provider_fetcher:
+                results = provider_fetcher(query, max_results=max_results)
+            else:
+                results = self.search_music(query, max_results=max_results)
+
+            if not results:
+                continue
+
+            for track in results:
+                normalized = self._normalize_track(track)
+                track_id = normalized.get("id")
+                artist_label = normalized.get("artist")
+                dedupe_key = track_id or f"{normalized.get('title')}::{artist_label}"
+
+                if dedupe_key in seen_keys:
+                    continue
+                seen_keys.add(dedupe_key)
+
+                if track_id and track_id in self._song_cache:
+                    continue
+
+                if track_id:
+                    self._song_cache.add(track_id)
+
+                normalized.setdefault("source", "theramuse_music_api")
+                if artist and not normalized.get("artist"):
+                    normalized["artist"] = artist
+                return normalized
+
+        return None
+
+    def validate_location_relevance(self, track: Dict, location: str) -> bool:
+
+        if not location or not track:
+            return True
+
+        location_lower = location.lower()
+        title = (track.get('title') or track.get('name') or '').lower()
+        artist = (track.get('artist') or '').lower()
+        album = (track.get('album') or '').lower()
+
+        location_in_title = location_lower in title
+        location_in_artist = location_lower in artist
+        location_in_album = location_lower in album
+
+        if location_lower in ['bangladesh', 'bangla', 'bengali']:
+            bengali_indicators = [
+                'bangla', 'bengali', 'dhaka', 'bangladesh', 'বাংলা', 'ঢাকা',
+                'bangla gaan', 'bengali song', 'bangla music', 'bangla folk',
+                'bangla pop', 'bangla modern', 'bangla classic'
+            ]
+            bengali_artists = [
+                'habib wahid', 'andrew kishore', 'runa laila', 'subir nandi',
+                'mahmuduzzaman babu', 'firoz shai', 'abdul jabbar', 'farida mahmud',
+                'shakila zafar', 'kumar biswajit', 'asif akbar', 'momtaz',
+                'abed hadi', 'ferdaus wahid', 'tahsan', 'minen', 'shironamhin'
+            ]
+
+            has_bengali_content = any(
+                indicator in title or indicator in artist or indicator in album
+                for indicator in bengali_indicators
+            )
+            has_bengali_artist = any(artist_name in artist for artist_name in bengali_artists)
+
+            return has_bengali_content or has_bengali_artist or location_in_title or location_in_artist or location_in_album
+        else:
+            regional_indicators = [
+                location_lower,
+                f"{location_lower} music",
+                f"{location_lower} song",
+                f"{location_lower} folk"
+            ]
+            has_regional_content = any(
+                indicator in title or indicator in artist or indicator in album
+                for indicator in regional_indicators
+            )
+
+            return has_regional_content or location_in_title or location_in_artist or location_in_album
+
+    def clear_cache(self):
+        self._song_cache.clear()
+        self._query_history.clear()
+        print(" Music search cache cleared")
+
+    def get_cache_size(self):
+        return len(self._song_cache)
+
+    def get_api_health_status(self) -> Dict:
+
+        status: Dict[str, Any] = {
+            "api_status": "healthy" if self.fetcher else "unavailable",
+            "service": "MusicSearchService"
+        }
+        if self._provider:
+            status["provider"] = self._provider.get_api_health_status()
+        return status
+
+
+
+class BangladeshiSingerQueryGenerator:
+    """Curated Bangladeshi artist query generator used for therapy recommendations."""
+
+    REGION_KEYWORDS = {
+        "dhaka": [
+            "dhaka", "manikganj", "gopalganj", "faridpur", "munshiganj", "kushtia",
+            "narayanganj", "gazipur"
+        ],
+        "chittagong": [
+            "chittagong", "chattogram", "cox", "cox's bazar", "bandarban",
+            "rangamati", "khagrachari"
+        ],
+        "sylhet": ["sylhet", "habiganj", "moulvibazar", "sunamganj"],
+        "rajshahi": ["rajshahi", "naogaon", "chapainawabganj", "bogura", "pabna"],
+        "rangpur": ["rangpur", "dinajpur", "kurigram", "gaibandha", "lalmonirhat"],
+        "khulna": ["khulna", "jessore", "satkhira", "bagerhat", "narail", "jhenaidah"],
+        "barisal": ["barisal", "barishal", "bhola", "jhalokathi", "pirojpur", "barguna"],
+        "mymensingh": ["mymensingh", "sherpur", "jamalpur", "netrokona"],
+    }
+
+    REGION_ARTISTS = {
+        "dhaka": [
+            "Sabina Yasmin", "Runa Laila", "Feroza Begum", "Habib Wahid", "Arnob",
+            "Tahsan Khan", "Momtaz Begum", "Andrew Kishore", "Subir Nandi",
+            "Azam Khan", "Kumar Biswajit", "Shironamhin", "LRB", "Miles",
+            "Nagar Baul", "Artcell", "Feedback"
+        ],
+        "chittagong": [
+            "Ayub Bachchu", "Pritom Hasan", "Satya Saha", "Souls", "Feedback",
+            "LRB", "Miles"
+        ],
+        "sylhet": [
+            "Subir Nandi", "Runa Laila", "Shah Abdul Karim", "Hason Raja",
+            "Rezwana Choudhury Bannya", "Shuvro Dev"
+        ],
+        "rajshahi": [
+            "James", "Abdul Alim", "Abbasuddin Ahmed", "Warfaze", "Aurthohin"
+        ],
+        "rangpur": [
+            "Abbasuddin Ahmed", "Rezwana Choudhury Bannya", "Momtaz Begum",
+            "Farida Parvin"
+        ],
+        "khulna": [
+            "Lalon Band", "Farida Parvin", "Fakir Alamgir", "Sharmin Sultana",
+            "Sukumar Baidya"
+        ],
+        "barisal": [
+            "Kumar Bishwajit", "Ferdous Wahid", "Shahnaz Rahmatullah",
+            "Minar Rahman"
+        ],
+        "mymensingh": [
+            "Momtaz Begum", "Imran Mahmudul", "Belal Khan", "Shahnaz Rahmatullah"
+        ],
+        "national": [
+            "Sabina Yasmin", "Runa Laila", "Habib Wahid", "Arnob", "Tahsan Khan",
+            "Andrew Kishore", "Subir Nandi", "Ayub Bachchu", "James", "Bappa Mazumder",
+            "Momtaz Begum", "Abdul Jabbar", "Feroza Begum", "Azam Khan", "Hridoy Khan",
+            "Asif Akbar", "Minar Rahman", "Imran Mahmudul", "Belal Khan", "Pritom Ahmed"
+        ],
+    }
+
+    LOCATION_TEMPLATES = [
+        "{location} nostalgic songs",
+        "{location} folk songs",
+        "{location} classic bangla songs",
+        "{location} golden oldies",
+        "{location} playback hits",
+    ]
+
+    def _normalize(self, value: Optional[str]) -> str:
+        return (value or "").strip().lower()
+
+    def _match_region(self, birthplace: Optional[str]) -> str:
+        normalized = self._normalize(birthplace)
+        for region, keywords in self.REGION_KEYWORDS.items():
+            if any(keyword in normalized for keyword in keywords):
+                return region
+        return "national"
+
+    def _build_artist_pool(self, region_key: str) -> List[str]:
+        pool = list(self.REGION_ARTISTS.get(region_key, []))
+        if region_key != "national":
+            pool += self.REGION_ARTISTS["national"][:10]
+        if not pool:
+            pool = list(self.REGION_ARTISTS["national"])
+        return pool
+
+    def _make_artist_query(self, artist: str, favorite_genre: str, variation: int) -> str:
+        genre = favorite_genre.strip().lower()
+        if genre and variation % 3 == 0:
+            return f"{artist} {genre} song"
+        if variation % 5 == 0:
+            return f"{artist} bengali folk song"
+        if variation % 2 == 0:
+            return f"{artist} bangla song"
+        return f"{artist} bengali song"
+
+    def get_queries(self, birthplace: Optional[str], favorite_genre: str = "") -> Dict:
+        location = (birthplace or "Bangladesh").strip()
+        favorite_genre_clean = favorite_genre.strip()
+
+        queries: List[str] = []
+
+        if location:
+            templates = list(self.LOCATION_TEMPLATES)
+            if favorite_genre_clean:
+                templates.append(f"{location} {favorite_genre_clean} songs")
+                templates.append(f"{favorite_genre_clean} songs from {location}")
+            for template in templates:
+                if "{location}" in template:
+                    queries.append(template.format(location=location))
+                else:
+                    queries.append(template)
+
+        region_key = self._match_region(location)
+        artist_pool = self._build_artist_pool(region_key)
+
+        variation_index = 0
+        while len(queries) < 24:
+            artist = artist_pool[variation_index % len(artist_pool)]
+            queries.append(self._make_artist_query(artist, favorite_genre_clean, variation_index))
+            variation_index += 1
+
+        deduped_queries: List[str] = []
+        seen: Set[str] = set()
+        for query in queries:
+            normalized = query.lower()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped_queries.append(query)
+            if len(deduped_queries) == 20:
+                break
+
+        return {
+            "birthplace": location,
+            "favorite_genre": favorite_genre_clean,
+            "queries": deduped_queries[:20],
+            "source": "curated_artist_database",
+            "region": region_key,
+        }
+
+
+class BangladeshiGenerationalMatrix:
+
+
+    GENERATIONAL_RAGA_MAPPING = {
+
+        (1931, 1955): {
+            "musical_context": "Rabindra Sangeet, Nazrul Geeti, Baul, early film scores",
+            "therapeutic_ragas": ["Yaman", "Bageshri", "Desh", "Khamaj", "Bhairavi"],
+            "focus": "calmness, patriotic connection, spiritual grounding, rest, healing"
+        },
+
+
+        (1956, 1965): {
+            "musical_context": "Band Revolution, Folk-Pop Fusion",
+            "therapeutic_ragas": ["Kafi", "Pahadi", "Bhairavi"],
+            "focus": "peace, tranquility, holistic healing, emotional balance"
+        },
+
+
+        (1966, 1980): {
+            "musical_context": "Rock, Electro-Fusion, Indie Pop",
+            "therapeutic_ragas": ["Darbari Kanada", "Durga", "Jogiya", "Maand"],
+            "focus": "emotional balance, stability, focus, resilience, stress management"
+        },
+
+
+        (1981, 1995): {
+            "musical_context": "Hip-Hop, EDM, Global Fusion",
+            "therapeutic_ragas": ["Keeravani", "Charukeshi", "Gauri", "Hamsadhwani"],
+            "focus": "upliftment, attention, optimism, relaxation, mental fatigue"
+        }
+    }
+
+    def get_generational_context(self, birth_year: int) -> Dict:
+
+        for (start_year, end_year), context in self.GENERATIONAL_RAGA_MAPPING.items():
+            if start_year <= birth_year <= end_year:
+                return {
+                    "birth_year": birth_year,
+                    "age_group": f"Born {start_year}-{end_year}",
+                    **context
+                }
+
+
+        return {
+            "birth_year": birth_year,
+            "age_group": "Unknown",
+            "musical_context": "General therapeutic music",
+            "therapeutic_ragas": ["Yaman", "Bageshri", "Desh"],
+            "focus": "general wellness"
+        }
+
+    def calculate_nostalgia_window(self, birth_year: int) -> Tuple[int, int]:
+
+
+        return (birth_year + 10, birth_year + 30)
+
+
+class BigFivePersonalityMapping:
+
+    BIG5_GENRE_MAPPING = {
+        "openness": {
+            (1, 2): ["Mainstream Pop", "Folk", "Easy Listening", "Classic Rock", "Soft Indie"],
+            (3, 4): ["Indie Rock", "Soft Alternative", "Progressive Rock", "Alternative"],
+            (5, 7): ["Art Rock", "Avant-Garde", "Jazz Fusion", "Contemporary Classical", "Experimental Electronic"]
+        },
+        "conscientiousness": {
+            (1, 2): ["Jam Band", "Lo-Fi", "Singer-Songwriter"],
+            (3, 4): ["Adult Contemporary", "Acoustic Folk", "Smooth Jazz"],
+            (5, 7): ["Baroque", "Orchestral", "Classical Symphony", "Opera"]
+        },
+        "extraversion": {
+            (1, 2): ["Chillout", "Ambient", "Easy Listening"],
+            (3, 4): ["Pop Rock", "Funk", "Soul", "Disco"],
+            (5, 7): ["Dance Music", "Hip-Hop", "EDM", "Reggae", "Club Music"]
+        },
+        "agreeableness": {
+            (1, 2): ["Hard Rock", "Heavy Metal", "Punk Rock", "Blues"],
+            (3, 4): ["Soft Rock", "Soft Pop"],
+            (5, 7): ["Jazz", "R&B", "Neo-Soul", "Smooth Jazz", "Orchestral"]
+        },
+        "neuroticism": {
+            (1, 2): ["Thrash Metal", "Hardcore Punk"],
+            (3, 4): ["Indie Pop", "Emo", "Trip-Hop"],
+            (5, 7): ["Ambient", "Dream Pop", "Classical Piano", "Meditative Music"]
+        }
+    }
+
+    TRAIT_AUDIO_PROFILES: Dict[str, Dict[str, List[Dict[str, Any]]]] = {
+        "extraversion": {
+            "high": [
+                {"key": "danceability", "min": 0.65, "weight": 3},
+                {"key": "energy", "min": 0.65, "weight": 3},
+                {"key": "tempo", "min": 100, "max": 180, "weight": 2},
+                {"key": "speechiness", "max": 0.55, "weight": 1},
+            ],
+            "medium": [
+                {"key": "danceability", "min": 0.5, "max": 0.75, "weight": 2},
+                {"key": "energy", "min": 0.5, "max": 0.75, "weight": 2},
+            ],
+            "low": [
+                {"key": "danceability", "max": 0.5, "weight": 2},
+                {"key": "energy", "max": 0.5, "weight": 2},
+                {"key": "acousticness", "min": 0.4, "weight": 1.5},
+            ],
+        },
+        "openness": {
+            "high": [
+                {"key": "acousticness", "min": 0.3, "max": 0.85, "weight": 2},
+                {"key": "energy", "min": 0.35, "max": 0.75, "weight": 1.5},
+                {"key": "liveness", "min": 0.15, "weight": 1},
+            ],
+            "medium": [
+                {"key": "acousticness", "min": 0.2, "max": 0.6, "weight": 1.5},
+                {"key": "danceability", "min": 0.45, "max": 0.7, "weight": 1.5},
+            ],
+            "low": [
+                {"key": "danceability", "min": 0.5, "weight": 1.5},
+                {"key": "energy", "min": 0.55, "weight": 1.5},
+            ],
+        },
+        "conscientiousness": {
+            "high": [
+                {"key": "tempo", "min": 60, "max": 140, "weight": 2},
+                {"key": "danceability", "min": 0.45, "max": 0.65, "weight": 1.5},
+                {"key": "liveness", "max": 0.4, "weight": 1},
+            ],
+            "medium": [
+                {"key": "tempo", "min": 60, "max": 150, "weight": 1.5},
+                {"key": "energy", "min": 0.4, "max": 0.7, "weight": 1.5},
+            ],
+            "low": [
+                {"key": "tempo", "max": 120, "weight": 1},
+                {"key": "speechiness", "max": 0.5, "weight": 1},
+            ],
+        },
+        "agreeableness": {
+            "high": [
+                {"key": "acousticness", "min": 0.5, "weight": 2},
+                {"key": "energy", "max": 0.6, "weight": 1.5},
+                {"key": "loudness", "max": -6, "weight": 1},
+            ],
+            "medium": [
+                {"key": "energy", "min": 0.4, "max": 0.65, "weight": 1.5},
+                {"key": "danceability", "min": 0.5, "max": 0.75, "weight": 1},
+            ],
+            "low": [
+                {"key": "energy", "min": 0.6, "weight": 1.5},
+                {"key": "liveness", "min": 0.3, "weight": 1},
+            ],
+        },
+        "neuroticism": {
+            "high": [
+                {"key": "energy", "max": 0.55, "weight": 2},
+                {"key": "danceability", "max": 0.55, "weight": 1.5},
+                {"key": "acousticness", "min": 0.45, "weight": 1.5},
+                {"key": "tempo", "max": 120, "weight": 1},
+            ],
+            "medium": [
+                {"key": "energy", "min": 0.4, "max": 0.7, "weight": 1.5},
+                {"key": "danceability", "min": 0.45, "max": 0.7, "weight": 1.5},
+            ],
+            "low": [
+                {"key": "energy", "min": 0.6, "weight": 2},
+                {"key": "danceability", "min": 0.6, "weight": 1.5},
+                {"key": "liveness", "min": 0.25, "weight": 1},
+            ],
+        },
+    }
+
+    def _score_band(self, value: float) -> str:
+        if value >= 5:
+            return "high"
+        if value <= 2:
+            return "low"
+        return "medium"
+
+    def _get_audio_preferences(self, trait: str, score: float) -> List[Dict[str, Any]]:
+        band = self._score_band(score)
+        return self.TRAIT_AUDIO_PROFILES.get(trait, {}).get(band, [])
+
+    def get_genres_for_personality(self, big5_scores: Dict) -> List[Dict[str, Any]]:
+
+        ordered_traits = sorted(big5_scores.items(), key=lambda item: item[1], reverse=True)
+        genre_preferences: List[Dict[str, Any]] = []
+        seen_pairs: Set[Tuple[str, str]] = set()
+
+        print(f"Processing Big 5 scores: {big5_scores}")
+
+        for trait, score in ordered_traits:
+            if trait not in self.BIG5_GENRE_MAPPING:
+                continue
+
+            print(f"  Processing {trait}: {score:.1f}")
+            for (low, high), genres in self.BIG5_GENRE_MAPPING[trait].items():
+                if low <= score <= high:
+                    print(f"    Range ({low}-{high}): {genres}")
+                    for genre in genres:
+                        pair = (trait, genre)
+                        if pair in seen_pairs:
+                            continue
+                        genre_preferences.append(
+                            {
+                                "trait": trait,
+                                "genre": genre,
+                                "score": score,
+                                "range": (low, high),
+                                "audio_preferences": self._get_audio_preferences(trait, score),
+                            }
+                        )
+                        seen_pairs.add(pair)
+                    break
+
+        print(f"🎵 Personality genres found ({len(genre_preferences)}). Top picks: {[entry['genre'] for entry in genre_preferences[:5]]}")
+        return genre_preferences
+
+    def _get_personality_interpretation(self, trait: str, score: float) -> str:
+
+        interpretations = {
+            "openness": {
+                (1, 2): "Prefers familiar and conventional music",
+                (3, 4): "Open to new musical experiences and diverse genres",
+                (5, 7): "Highly creative, seeks innovative and experimental music"
+            },
+            "conscientiousness": {
+                (1, 2): "Prefers spontaneous and relaxed musical styles",
+                (3, 4): "Appreciates structured and organized musical compositions",
+                (5, 7): "Prefers disciplined and complex musical arrangements"
+            },
+            "extraversion": {
+                (1, 2): "Enjoys calm and introspective music",
+                (3, 4): "Likes energetic and socially engaging music",
+                (5, 7): "Drawn to highly stimulating and upbeat music"
+            },
+            "agreeableness": {
+                (1, 2): "Enjoys intense and emotionally diverse music",
+                (3, 4): "Prefers harmonious and warm musical content",
+                (5, 7): "Seeks peaceful and cooperative musical themes"
+            },
+            "neuroticism": {
+                (1, 2): "Emotionally stable, enjoys diverse musical moods",
+                (3, 4): "Music helps manage stress and emotional expression",
+                (5, 7): "Uses music for emotional regulation and comfort"
+            }
+        }
+
+        trait_interpretations = interpretations.get(trait, {})
+        for range_key, interpretation in trait_interpretations.items():
+            if range_key[0] <= score <= range_key[1]:
+                return interpretation
+        return "Moderate preference across musical styles"
+
+
+class DementiaTherapy:
+
+
+    VERSION = "Theramuse2.1"
+
+    def __init__(self, db: Optional[DatabaseManager] = None):
+        print(f" Loading DementiaTherapy v{self.VERSION}...")
+        self.db = db
+        self.music_service = MusicSearchService()
+        self.singer_query_generator = BangladeshiSingerQueryGenerator()
+        self.generational_matrix = BangladeshiGenerationalMatrix()
+        self.personality_mapping = BigFivePersonalityMapping()
+
+
+        self.therapeutic_queries = {
+            "difficulty_sleeping": [
+                "estas tonne song",
+                "432 hz music",
+                "hypnosis music",
+                "829 hz music",
+                "Pere Andre Farah",
+                "Classical Music to Make Your Brain Shut Up",
+                "barber beat music",
+                "Vaporwave music",
+                "Khruangbin",
+                "Hermanos Gutiérrez"
+            ],
+            "trouble_remembering": [
+                "estas tonne song",
+                "Classical Music to Make Your Brain Shut Up",
+                "829 hz music",
+                "Khruangbin",
+                "Hermanos Gutiérrez",
+                "Pere Andre Farah"
+            ],
+            "forgets_everyday_things": [
+                "estas tonne song",
+                "Classical Music to Make Your Brain Shut Up",
+                "829 hz music",
+                "Khruangbin",
+                "Hermanos Gutiérrez",
+                "Pere Andre Farah"
+            ],
+            "difficulty_recalling_old_memories": [
+                "estas tonne song",
+                "Classical Music to Make Your Brain Shut Up",
+                "829 hz music",
+                "Khruangbin",
+                "Hermanos Gutiérrez",
+                "Pere Andre Farah"
+            ],
+            "memory_worse_than_year_ago": [
+                "estas tonne song",
+                "Classical Music to Make Your Brain Shut Up",
+                "829 hz music",
+                "Khruangbin",
+                "Hermanos Gutiérrez",
+                "Pere Andre Farah"
+            ],
+            "visited_mental_health_professional": [
+                "relax saxophone",
+                "Khruangbin"
+            ],
+            "memory_issues": [
+                "memory enhancement music",
+                "cognitive therapy music"
+            ]
+        }
+
+    def _fetch_songs_for_query(
+        self,
+        query: str,
+        songs_store: List[Dict],
+        target_count: int,
+        log_label: str
+    ) -> int:
+
+
+        remaining = target_count - len(songs_store)
+        if remaining <= 0:
+            return 0
+
+
+        max_results = min(5, remaining)
+
+
+        import time
+        time.sleep(0.5)
+
+        fetched_songs = self.music_service.search_music(query, max_results=max_results)
+        trimmed_songs = fetched_songs[:remaining]
+
+        if trimmed_songs:
+            songs_store.extend(trimmed_songs)
+
+        print(f"{log_label}: {len(trimmed_songs)} songs")
+        return len(trimmed_songs)
+
+    def _fetch_songs_for_query_with_validation(
+        self,
+        query: str,
+        songs_store: List[Dict],
+        target_count: int,
+        log_label: str,
+        location: str = None
+    ) -> int:
+
+
+        remaining = target_count - len(songs_store)
+        if remaining <= 0:
+            return 0
+
+        max_results = min(8, remaining)
+
+
+        import time
+        time.sleep(0.5)
+
+        fetched_songs = self.music_service.search_music(query, max_results=max_results)
+
+
+        valid_songs = []
+        for song in fetched_songs:
+            if self.music_service.validate_location_relevance(song, location):
+                valid_songs.append(song)
+                if len(valid_songs) >= remaining:
+                    break
+
+        if valid_songs:
+            songs_store.extend(valid_songs)
+            print(f"{log_label}: {len(valid_songs)} location-relevant songs from {len(fetched_songs)} fetched")
+        else:
+            print(f"{log_label}: 0 location-relevant songs found for '{query}'")
+
+        return len(valid_songs)
+
+    def _get_genres_for_trait_score(self, trait: str, score: float) -> List[str]:
+
+        trait_mapping = self.personality_mapping.BIG5_GENRE_MAPPING.get(trait, {})
+        for range_key, genres in trait_mapping.items():
+            if range_key[0] <= score <= range_key[1]:
+                return genres
+        return []
+
+    def _personalize_csv_matches(self, matches: List[Dict[str, Any]], patient_identifier: Optional[str]) -> List[Dict[str, Any]]:
+        if not matches or not patient_identifier:
+            return matches
+        try:
+            seed_int = int(hashlib.sha256(patient_identifier.encode("utf-8")).hexdigest(), 16)
+        except Exception:
+            return matches
+        seeded_rng = random.Random(seed_int)
+        reordered = matches[:]
+        seeded_rng.shuffle(reordered)
+        return reordered
+
+    def get_dementia_recommendations(self, patient_info: Dict) -> Dict:
+
+
+        print("\n" + "="*60)
+        print("Generating Dementia/Alzheimer's Therapy Recommendations...")
+        print("="*60)
+
+
+        birth_year = patient_info.get("birth_year")
+        birthplace_country = patient_info.get("birthplace_country", "")
+        birthplace_city = patient_info.get("birthplace_city", "")
+        instruments = patient_info.get("instruments", [])
+        favorite_genre_input = patient_info.get("favorite_genre", "")
+        favorite_genres = []
+        if isinstance(favorite_genre_input, list):
+            favorite_genres = [
+                genre.strip()
+                for genre in favorite_genre_input
+                if isinstance(genre, str) and genre.strip()
+            ]
+        elif isinstance(favorite_genre_input, str):
+            favorite_genre_input = favorite_genre_input.strip()
+            if ',' in favorite_genre_input:
+                favorite_genres = [
+                    genre.strip()
+                    for genre in favorite_genre_input.split(',')
+                    if genre.strip()
+                ]
+            elif favorite_genre_input:
+                favorite_genres = [favorite_genre_input]
+        favorite_genre = favorite_genres[0] if favorite_genres else (
+            favorite_genre_input if isinstance(favorite_genre_input, str) else ""
+        )
+        favorite_musician = patient_info.get("favorite_musician", "").strip()
+
+        if favorite_musician:
+            favorite_musician = favorite_musician.title()
+        favorite_season = patient_info.get("favorite_season", "")
+        natural_elements = patient_info.get("natural_elements", [])
+        big5_scores = patient_info.get("big5_scores", {})
+        patient_unique_id = (
+            patient_info.get("_theramuse_patient_id")
+            or patient_info.get("patient_id")
+            or patient_info.get("name")
+        )
+
+
+        difficulty_sleeping = patient_info.get("difficulty_sleeping", False)
+        trouble_remembering = patient_info.get("trouble_remembering", False)
+        forgets_everyday_things = patient_info.get("forgets_everyday_things", False)
+        difficulty_recalling_old_memories = patient_info.get("difficulty_recalling_old_memories", False)
+        memory_worse_than_year_ago = patient_info.get("memory_worse_than_year_ago", False)
+        visited_mental_health = patient_info.get("visited_mental_health_professional", False)
+        memory_issues = any([
+            forgets_everyday_things,
+            difficulty_recalling_old_memories,
+            memory_worse_than_year_ago
+        ])
+
+
+        if birth_year:
+            nostalgia_start, nostalgia_end = self.generational_matrix.calculate_nostalgia_window(birth_year)
+            generational_context = self.generational_matrix.get_generational_context(birth_year)
+            print(f" Nostalgia window: {nostalgia_start}-{nostalgia_end}")
+        else:
+            nostalgia_start, nostalgia_end = 1990, 2010
+            generational_context = {"therapeutic_ragas": ["Yaman", "Bageshri"]}
+
+        recommendations = {
+            "patient_context": {
+                "birth_year": birth_year,
+                "nostalgia_window": f"{nostalgia_start}-{nostalgia_end}",
+                "generational_context": generational_context
+            },
+            "categories": {}
+        }
+
+
+        if birthplace_country:
+            country_target = 20
+            country_songs: List[Dict] = []
+            country_queries: List[str] = []
+            country_song_recommendations: List[str] = []
+            favorite_genre_song_recommendations: List[str] = []
+
+
+            print(f"🎼 Using curated singer database for {birthplace_country} recommendations...")
+            curated_country_queries = self.singer_query_generator.get_queries(
+                birthplace_country, favorite_genre
+            )
+
+
+            for query in curated_country_queries["queries"]:
+                if len(country_songs) >= country_target:
+                    break
+
+                added = self._fetch_songs_for_query_with_validation(
+                    query,
+                    country_songs,
+                    country_target,
+                    f" Birthplace Country ({birthplace_country} - curated)",
+                    birthplace_country
+                )
+                if added:
+                    country_queries.append(query)
+                    country_song_recommendations.append(
+                        f"birthplace country song recommendation={query}"
+                    )
+
+
+            if len(country_songs) < country_target:
+                print(f"🔄 Using fallback strategy for {birthplace_country} with nostalgia focus...")
+                if favorite_genres:
+                    for index, genre in enumerate(favorite_genres[:3], start=1):
+
+
+                        query_variations = [
+                            f"{birthplace_country} {genre} {nostalgia_start}s",
+                            f"Bangla {genre} {nostalgia_start}-{nostalgia_end}",
+                            f"Bengali {genre} nostalgia {nostalgia_start}",
+                            f"{birthplace_country} nostalgic {genre} songs",
+                            f"Bangla {genre} {nostalgia_start} classics",
+                            f"{genre} bangla gaan {nostalgia_start}"
+                        ]
+
+                        for query in query_variations:
+                            if len(country_songs) >= country_target:
+                                break
+                            added = self._fetch_songs_for_query_with_validation(
+                                query,
+                                country_songs,
+                                country_target,
+                                f" Birthplace Country Nostalgia ({birthplace_country} + {genre} + {nostalgia_start}s)",
+                                birthplace_country
+                            )
+                            if added:
+                                country_queries.append(query)
+                                favorite_genre_song_recommendations.append(
+                                    f"favourite genre {index} nostalgia={query}"
+                                )
+                            if len(country_songs) >= country_target:
+                                break
+
+
+            if len(country_songs) < country_target:
+                if favorite_genre:
+                    general_queries = [
+                        f"Bangla {favorite_genre} nostalgic songs {nostalgia_start}-{nostalgia_end}",
+                        f"Bengali {favorite_genre} classic songs {nostalgia_start}s",
+                        f"{birthplace_country} {favorite_genre} hits {nostalgia_start}",
+                        f"Bangla {favorite_genre} golden oldies {nostalgia_start}",
+                        f"Bangla {favorite_genre} memories {nostalgia_start}s"
+                    ]
+                else:
+                    general_queries = [
+                        f"Bangla nostalgic songs {nostalgia_start}-{nostalgia_end}",
+                        f"Bengali classic songs {nostalgia_start}s",
+                        f"{birthplace_country} hit songs {nostalgia_start}",
+                        f"Bangla golden oldies {nostalgia_start}",
+                        f"Bangla memories {nostalgia_start}s"
+                    ]
+
+                for query in general_queries:
+                    if len(country_songs) >= country_target:
+                        break
+                    added = self._fetch_songs_for_query(
+                        query,
+                        country_songs,
+                        country_target,
+                        f" Birthplace Country General ({birthplace_country})"
+                    )
+                    if added:
+                        country_queries.append(query)
+
+            recommendations["categories"]["birthplace_country"] = {
+                "query": country_queries if len(country_queries) > 1 else (country_queries[0] if country_queries else ""),
+                "songs": country_songs,
+                "count": len(country_songs),
+                "song_recommendations": (
+                    country_song_recommendations
+                    if len(country_song_recommendations) > 1
+                    else (country_song_recommendations[0] if country_song_recommendations else "")
+                ),
+                "query_source": curated_country_queries["source"]
+            }
+            if favorite_genre_song_recommendations:
+                recommendations["categories"]["birthplace_country"]["favorite_genre_song_recommendations"] = (
+                    favorite_genre_song_recommendations
+                    if len(favorite_genre_song_recommendations) > 1
+                    else favorite_genre_song_recommendations[0]
+                )
+
+
+        if birthplace_city:
+            city_target = 20
+            city_songs: List[Dict] = []
+            city_queries: List[str] = []
+            city_song_recommendations: List[str] = []
+            city_query_recommendations = {"queries": [], "source": "csv_database"}
+
+            csv_added = 0
+            if self.db:
+                csv_rows = self.db.get_songs_for_nostalgia_window(
+                    birthplace_city,
+                    nostalgia_start,
+                    nostalgia_end,
+                    limit=city_target,
+                )
+                for row in csv_rows:
+                    song_name = (row.get("song_name") or "").strip()
+                    if not song_name:
+                        continue
+                    artist_name = (row.get("artist_name") or "").strip()
+
+                    track = self.music_service.get_track_metadata(song_name, artist_name or None)
+                    if track:
+                        metadata = track.setdefault("metadata", {})
+                        if row.get("release_value"):
+                            metadata["release_value"] = str(row["release_value"])
+                        metadata["source"] = "csv_nostalgia_lookup"
+                        if artist_name and not track.get("artist"):
+                            track["artist"] = artist_name
+                        city_songs.append(track)
+                        city_song_recommendations.append(
+                            f"{song_name} by {track.get('artist', artist_name or 'Unknown Artist')}"
+                        )
+                    else:
+                        fallback_track = {
+                            "title": song_name,
+                            "artist": artist_name or "Unknown Artist",
+                            "description": f"Nostalgia CSV match for {song_name}",
+                            "fallback": True,
+                            "metadata": {
+                                "csv_row": row,
+                                "source": "csv_nostalgia_lookup"
+                            }
+                        }
+                        if row.get("release_value"):
+                            fallback_track["metadata"]["release_value"] = str(row["release_value"])
+                        city_songs.append(fallback_track)
+                        city_song_recommendations.append(
+                            f"{song_name} by {artist_name or 'Unknown Artist'} (csv fallback)"
+                        )
+
+                    csv_added += 1
+                    if len(city_songs) >= city_target:
+                        break
+
+                if csv_added:
+                    city_queries.append(f"CSV nostalgia lookup {nostalgia_start}-{nostalgia_end}")
+                    print(f"✅ Added {csv_added} nostalgia songs from CSV for {birthplace_city}")
+            else:
+                print("ℹ️  Database connection unavailable; skipping CSV nostalgia lookup for birthplace city.")
+
+            if len(city_songs) < city_target:
+                print(f"🎼 Using curated singer database for {birthplace_city} recommendations...")
+                city_query_recommendations = self.singer_query_generator.get_queries(
+                    birthplace_city, favorite_genre
+                )
+
+                for query in city_query_recommendations["queries"]:
+                    if len(city_songs) >= city_target:
+                        break
+
+                    added = self._fetch_songs_for_query_with_validation(
+                        query,
+                        city_songs,
+                        city_target,
+                        f"  Birthplace City ({birthplace_city} - curated)",
+                        birthplace_city
+                    )
+                    if added:
+                        city_queries.append(query)
+                        city_song_recommendations.append(
+                            f"birthplace city song recommendation={query}"
+                        )
+
+            if len(city_songs) < city_target:
+                print(f"🔄 Using fallback strategy for {birthplace_city} with nostalgia focus...")
+                if favorite_genres:
+                    for genre in favorite_genres[:3]:
+
+                        query_variations = [
+                            f"{birthplace_city} {genre} {nostalgia_start}s",
+                            f"Bangla {genre} {nostalgia_start}-{nostalgia_end}",
+                            f"Bengali {genre} nostalgia {nostalgia_start}",
+                            f"{birthplace_city} nostalgic {genre} songs",
+                            f"Bangla {genre} {nostalgia_start} classics",
+                            f"{genre} bangla gaan {nostalgia_start}"
+                        ]
+
+                        for query in query_variations:
+                            if len(city_songs) >= city_target:
+                                break
+                            added = self._fetch_songs_for_query_with_validation(
+                                query,
+                                city_songs,
+                                city_target,
+                                f"  Birthplace City Fallback ({birthplace_city} + {genre})",
+                                birthplace_city
+                            )
+                            if added:
+                                city_queries.append(query)
+                                city_song_recommendations.append(
+                                    f"birthplace city song recommendation={query}"
+                                )
+                            if len(city_songs) >= city_target:
+                                break
+
+            if len(city_songs) < city_target:
+                if favorite_genre:
+                    general_queries = [
+                        f"Bangla {favorite_genre} nostalgic songs {nostalgia_start}-{nostalgia_end}",
+                        f"Bengali {favorite_genre} classic songs {nostalgia_start}s",
+                        f"{birthplace_city} {favorite_genre} hits {nostalgia_start}",
+                        f"Bangla {favorite_genre} golden oldies {nostalgia_start}",
+                        f"Bangla {favorite_genre} memories {nostalgia_start}s"
+                    ]
+                else:
+                    general_queries = [
+                        f"Bangla nostalgic songs {nostalgia_start}-{nostalgia_end}",
+                        f"Bengali classic songs {nostalgia_start}s",
+                        f"{birthplace_city} hit songs {nostalgia_start}",
+                        f"Bangla golden oldies {nostalgia_start}",
+                        f"Bangla memories {nostalgia_start}s"
+                    ]
+
+                for query in general_queries:
+                    if len(city_songs) >= city_target:
+                        break
+                    added = self._fetch_songs_for_query(
+                        query,
+                        city_songs,
+                        city_target,
+                        f"  Birthplace City General ({birthplace_city})"
+                    )
+                    if added:
+                        city_queries.append(query)
+                        city_song_recommendations.append(
+                            f"birthplace city song recommendation={query}"
+                        )
+
+            recommendations["categories"]["birthplace_city"] = {
+                "query": city_queries if len(city_queries) > 1 else (city_queries[0] if city_queries else ""),
+                "songs": city_songs,
+                "count": len(city_songs),
+                "song_recommendations": (
+                    city_song_recommendations
+                    if len(city_song_recommendations) > 1
+                    else (city_song_recommendations[0] if city_song_recommendations else "")
+                ),
+                "query_source": city_query_recommendations.get("source", "csv_database")
+            }
+
+
+        if instruments:
+            instrument_target = 10
+            instrument_songs: List[Dict] = []
+            instrument_queries: List[str] = []
+            existing_instrument_ids: Set[str] = set()
+
+            for instrument in instruments[:5]:
+                query = f"{instrument} song"
+                added = self._fetch_songs_for_query(
+                    query,
+                    instrument_songs,
+                    instrument_target,
+                    f" Instrument ({instrument})"
+                )
+                if added:
+                    instrument_queries.append(query)
+                    existing_instrument_ids.update(
+                        str(song.get("id") or song.get("title")) for song in instrument_songs if (song.get("id") or song.get("title"))
+                    )
+                if len(instrument_songs) >= instrument_target:
+                    break
+
+            if len(instrument_songs) < instrument_target:
+                csv_provider = getattr(self.music_service, "_provider", None)
+                if csv_provider and hasattr(csv_provider, "search_by_patient_preferences"):
+                    csv_profile = {
+                        "instruments": instruments,
+                        "preferred_languages": patient_info.get("preferred_languages") or patient_info.get("preferredLanguages"),
+                        "favorite_genre": patient_info.get("favorite_genre") or favorite_genres,
+                        "favoriteGenres": favorite_genres if favorite_genres else None,
+                    }
+                    csv_matches = csv_provider.search_by_patient_preferences(
+                        {key: value for key, value in csv_profile.items() if value},
+                        max_results=instrument_target - len(instrument_songs),
+                    )
+                    if csv_matches:
+                        for match in csv_matches:
+                            if len(instrument_songs) >= instrument_target:
+                                break
+                            match_id = str(match.get("id") or match.get("title"))
+                            if match_id in existing_instrument_ids:
+                                continue
+                            instrument_songs.append(match)
+                            existing_instrument_ids.add(match_id)
+                        if any(match.get("source") == "local_csv_preferences" for match in csv_matches):
+                            instrument_queries.append("local_csv_preferences")
+
+            recommendations["categories"]["instruments"] = {
+                "query": instrument_queries if len(instrument_queries) > 1 else (instrument_queries[0] if instrument_queries else ""),
+                "songs": instrument_songs,
+                "count": len(instrument_songs)
+            }
+
+
+        if favorite_season:
+            season_target = 10
+            season_songs: List[Dict] = []
+            season_queries = []
+
+
+            query = f"{favorite_season} song"
+            added = self._fetch_songs_for_query(
+                query,
+                season_songs,
+                season_target,
+                f" Season ({favorite_season})"
+            )
+            if added:
+                season_queries.append(query)
+
+
+            if len(season_songs) < season_target:
+                fallback_queries = [
+                    f"{favorite_season} music",
+                    f"{favorite_season} vibes",
+                    f"{favorite_season} playlist",
+                    f"spring songs collection",
+                    f"beautiful spring music",
+                    f"spring instrumental music"
+                ]
+                for fallback_query in fallback_queries:
+                    if len(season_songs) >= season_target:
+                        break
+                    added = self._fetch_songs_for_query(
+                        fallback_query,
+                        season_songs,
+                        season_target,
+                        f" Season Fallback ({fallback_query})"
+                    )
+                    if added:
+                        season_queries.append(fallback_query)
+
+            recommendations["categories"]["seasonal"] = {
+                "query": season_queries if len(season_queries) > 1 else (season_queries[0] if season_queries else f"{favorite_season} song"),
+                "songs": season_songs,
+                "count": len(season_songs)
+            }
+            print(f" Season ({favorite_season}): {len(season_songs)} songs")
+
+
+        if natural_elements:
+            natural_target = 10
+            nature_songs: List[Dict] = []
+            natural_queries: List[str] = []
+            for element in natural_elements[:5]:
+
+                query = f"{element} song"
+                added = self._fetch_songs_for_query(
+                    query,
+                    nature_songs,
+                    natural_target,
+                    f" Natural Element ({element})"
+                )
+                if added:
+                    natural_queries.append(query)
+                if len(nature_songs) >= natural_target:
+                    break
+
+
+                if len(nature_songs) < natural_target:
+                    fallback_queries = [
+                        f"{element} music",
+                        f"{element} sounds",
+                        f"{element} ambient",
+                        f"rain sounds for sleeping",
+                        f"nature sounds rain",
+                        f"rain and thunder sounds"
+                    ]
+                    for fallback_query in fallback_queries:
+                        if len(nature_songs) >= natural_target:
+                            break
+                        added = self._fetch_songs_for_query(
+                            fallback_query,
+                            nature_songs,
+                            natural_target,
+                            f" Natural Element Fallback ({fallback_query})"
+                        )
+                        if added:
+                            natural_queries.append(fallback_query)
+                        if len(nature_songs) >= natural_target:
+                            break
+
+            recommendations["categories"]["natural_elements"] = {
+                "query": natural_queries if len(natural_queries) > 1 else (natural_queries[0] if natural_queries else f"{natural_elements[0]} song"),
+                "songs": nature_songs,
+                "count": len(nature_songs)
+            }
+
+
+        if favorite_genre:
+            genre_target = 10
+            genre_songs: List[Dict] = []
+            genre_queries = []
+            existing_genre_ids: Set[str] = set()
+
+            csv_provider = getattr(self.music_service, "_provider", None)
+            if csv_provider and hasattr(csv_provider, "search_by_genres"):
+                csv_terms = [genre for genre in favorite_genres if genre] or [favorite_genre]
+                # Preserve input order while removing duplicates
+                seen_terms: Set[str] = set()
+                csv_terms = [term for term in csv_terms if not (term in seen_terms or seen_terms.add(term))]
+                csv_matches = csv_provider.search_by_genres(csv_terms, max_results=genre_target)
+                csv_appended = False
+                for match in csv_matches or []:
+                    if len(genre_songs) >= genre_target:
+                        break
+                    match_id = str(match.get("id") or match.get("title") or "")
+                    if match_id and match_id in existing_genre_ids:
+                        continue
+                    genre_songs.append(match)
+                    if match_id:
+                        existing_genre_ids.add(match_id)
+                    csv_appended = True
+                if csv_appended:
+                    label = ", ".join(csv_terms[:3])
+                    label = label or "local_csv_catalog"
+                    genre_queries.append(f"{label} (local_csv)")
+
+
+            if birthplace_country:
+
+                primary_queries = [
+                    f"{birthplace_country} {favorite_genre} {nostalgia_start}s",
+                    f"Bangla {favorite_genre} nostalgic {nostalgia_start}-{nostalgia_end}",
+                    f"Bengali {favorite_genre} classics {nostalgia_start}",
+                    f"{birthplace_country} {favorite_genre} golden oldies"
+                ]
+
+                for query in primary_queries:
+                    if len(genre_songs) >= genre_target:
+                        break
+                    added = self._fetch_songs_for_query_with_validation(
+                        query,
+                        genre_songs,
+                        genre_target,
+                        f" Favorite Genre Region-Nostalgia ({favorite_genre} + {birthplace_country})",
+                        birthplace_country
+                    )
+                    if added:
+                        genre_queries.append(query)
+
+
+            if len(genre_songs) < genre_target:
+                fallback_queries = [
+                    f"{favorite_genre} songs {nostalgia_start}",
+                    f"classic {favorite_genre} hits {nostalgia_start}s",
+                    f"best {favorite_genre} songs {nostalgia_start}-{nostalgia_end}",
+                    f"{favorite_genre} nostalgic songs",
+                    f"top {favorite_genre} tracks",
+                    f"classic {favorite_genre} hits"
+                ]
+
+                for fallback_query in fallback_queries:
+                    if len(genre_songs) >= genre_target:
+                        break
+
+                    added = 0
+                    if birthplace_country:
+                        added = self._fetch_songs_for_query_with_validation(
+                            fallback_query,
+                            genre_songs,
+                            genre_target,
+                            f" Favorite Genre Fallback ({fallback_query})",
+                            birthplace_country
+                        )
+                    if not added:
+                        added = self._fetch_songs_for_query(
+                            fallback_query,
+                            genre_songs,
+                            genre_target,
+                            f" Favorite Genre Fallback ({fallback_query})"
+                        )
+                    if added:
+                        genre_queries.append(fallback_query)
+
+            if genre_songs:
+                deduped: List[Dict] = []
+                seen_song_keys: Set[str] = set()
+                for song in genre_songs:
+                    key = str(song.get("id") or "").strip()
+                    if not key:
+                        title = str(song.get("title") or "").strip()
+                        artist = str(song.get("artist") or "").strip()
+                        key = f"{title}::{artist}" if title or artist else f"row::{len(seen_song_keys)}"
+                    if key in seen_song_keys:
+                        continue
+                    seen_song_keys.add(key)
+                    deduped.append(song)
+                genre_songs = deduped
+
+            recommendations["categories"]["favorite_genre"] = {
+                "query": genre_queries if len(genre_queries) > 1 else (genre_queries[0] if genre_queries else query),
+                "songs": genre_songs,
+                "count": len(genre_songs)
+            }
+            print(f" Favorite Genre ({favorite_genre}): {len(genre_songs)} songs")
+
+
+        if favorite_musician:
+            musician_target = 10
+            musician_songs: List[Dict] = []
+            musician_queries = []
+
+
+            query = f"{favorite_musician} songs"
+            songs = self.music_service.search_music(query, max_results=musician_target)
+            if songs:
+                musician_songs.extend(songs)
+                musician_queries.append(query)
+                print(f" Favorite Musician ({favorite_musician}): {len(songs)} songs (primary)")
+
+
+            if len(musician_songs) < musician_target:
+                fallback_queries = [
+                    f"{favorite_musician} music",
+                    f"{favorite_musician} official",
+                    f"best {favorite_musician}",
+                    f"{favorite_musician} greatest hits",
+                    f"{favorite_musician} playlist",
+                    f"mozart classical music",
+                    f"mozart piano sonatas",
+                    f"mozart symphony",
+                    f"best classical mozart",
+                    f"mozart requiem"
+                ]
+                for fallback_query in fallback_queries:
+                    if len(musician_songs) >= musician_target:
+                        break
+                    songs = self.music_service.search_music(fallback_query, max_results=musician_target - len(musician_songs))
+                    if songs:
+                        musician_songs.extend(songs)
+                        musician_queries.append(fallback_query)
+                        print(f" Favorite Musician fallback ({fallback_query}): {len(songs)} songs")
+
+            recommendations["categories"]["favorite_musician"] = {
+                "query": musician_queries if len(musician_queries) > 1 else (musician_queries[0] if musician_queries else query),
+                "songs": musician_songs,
+                "count": len(musician_songs)
+            }
+            print(f" Favorite Musician ({favorite_musician}): {len(musician_songs)} total songs")
+
+
+        therapeutic_conditions = {
+            "difficulty_sleeping": difficulty_sleeping,
+            "trouble_remembering": trouble_remembering,
+            "forgets_everyday_things": forgets_everyday_things,
+            "difficulty_recalling_old_memories": difficulty_recalling_old_memories,
+            "memory_worse_than_year_ago": memory_worse_than_year_ago,
+            "visited_mental_health_professional": visited_mental_health
+        }
+
+        for condition_key, is_true in therapeutic_conditions.items():
+            if is_true:
+
+                condition_songs: List[Dict] = []
+                condition_queries_used: List[str] = []
+
+
+                for query in self.therapeutic_queries[condition_key]:
+                    added = self._fetch_songs_for_query(
+                        query,
+                        condition_songs,
+                        5,
+                        f" {condition_key.replace('_', ' ').title()} ({query})"
+                    )
+                    if added:
+                        condition_queries_used.append(query)
+                    if len(condition_songs) >= 5:
+                        break
+
+
+                if not condition_songs:
+                    category_name = condition_key.replace('_', ' ').title()
+                    for query in self.therapeutic_queries[condition_key][:5]:
+                        fallback_song = {
+                            "title": f"Therapeutic Music for {category_name}",
+                            "description": f"Recommended therapeutic music for {category_name.lower()}. Please search for this music on your preferred platform.",
+                            "fallback": True
+                        }
+                        condition_songs.append(fallback_song)
+                    condition_queries_used = [self.therapeutic_queries[condition_key][0]]
+
+
+                category_name = condition_key.replace('_', ' ').title()
+                recommendations["categories"][condition_key] = {
+                    "query": condition_queries_used[0] if condition_queries_used else "",
+                    "songs": condition_songs[:5],
+                    "count": len(condition_songs[:5]),
+                    "condition": condition_key
+                }
+                print(f" {category_name}: {len(condition_songs[:5])} songs added")
+            else:
+
+                print(f" {condition_key.replace('_', ' ').title()}: False - no songs suggested")
+
+
+        if big5_scores:
+            print(f"🎭 Starting Personality-Based recommendations...")
+            personality_target = 10
+            personality_entries = self.personality_mapping.get_genres_for_personality(big5_scores)
+            personality_songs: List[Dict[str, Any]] = []
+            personality_queries: List[str] = []
+            personality_song_ids: Set[str] = set()
+            personality_display_genres = [entry["genre"] for entry in personality_entries][:5]
+            personality_refresh_required = bool(patient_info.get("_big5_changed"))
+            historical_personality_ids: Set[str] = set()
+            if personality_refresh_required:
+                seen_ids = patient_info.get("_seen_personality_song_ids") or []
+                historical_personality_ids = {
+                    str(item).strip()
+                    for item in seen_ids
+                    if str(item).strip()
+                }
+
+            if not personality_entries:
+                print(f" No personality genres returned!")
+            else:
+                print(f" Got {len(personality_entries)} personality genre entries")
+
+            def add_personality_song(song: Dict[str, Any], trait: Optional[str] = None) -> bool:
+                key = song.get("id") or song.get("title")
+                if not key:
+                    key = f"fallback::{len(personality_songs)}::{random.random()}"
+                key = str(key)
+                if personality_refresh_required and key in historical_personality_ids:
+                    return False
+                if key in personality_song_ids:
+                    return False
+                personality_songs.append(song)
+                personality_song_ids.add(key)
+                if personality_refresh_required:
+                    historical_personality_ids.add(key)
+                if trait:
+                    song.setdefault("metadata", {})["personality_trait"] = trait
+                return True
+
+            csv_provider = getattr(self.music_service, "_provider", None)
+
+            trait_limits: Dict[str, int] = defaultdict(int)
+            max_per_trait = 2
+
+            if csv_provider and hasattr(csv_provider, "search_by_personality"):
+                exclude_ids = set(historical_personality_ids) if historical_personality_ids else None
+                csv_personality_matches = csv_provider.search_by_personality(
+                    big5_scores,
+                    max_results=personality_target,
+                    exclude_ids=exclude_ids,
+                )
+                csv_personality_matches = self._personalize_csv_matches(csv_personality_matches or [], patient_unique_id)
+                for match in csv_personality_matches or []:
+                    if len(personality_songs) >= personality_target:
+                        break
+                    metadata = match.get("metadata") or {}
+                    trait = metadata.get("personality_trait")
+                    if trait and trait_limits[trait] >= max_per_trait:
+                        continue
+                    if add_personality_song(match, trait):
+                        if trait:
+                            trait_limits[trait] += 1
+                if csv_personality_matches:
+                    personality_queries.append("local_csv_personality")
+
+            if len(personality_songs) < personality_target and csv_provider and hasattr(csv_provider, "search_by_personality"):
+                exclude_ids = set(personality_song_ids) | set(historical_personality_ids)
+                csv_topup_matches = csv_provider.search_by_personality(
+                    big5_scores,
+                    max_results=personality_target * 2,
+                    exclude_ids=exclude_ids,
+                )
+                csv_topup_matches = self._personalize_csv_matches(csv_topup_matches or [], patient_unique_id)
+                for match in csv_topup_matches or []:
+                    if len(personality_songs) >= personality_target:
+                        break
+                    metadata = match.get("metadata") or {}
+                    trait = metadata.get("personality_trait")
+                    if trait and trait_limits[trait] >= max_per_trait + 1:
+                        trait = None
+                    if add_personality_song(match, trait):
+                        if trait:
+                            trait_limits[trait] += 1
+                if csv_topup_matches:
+                    personality_queries.append("local_csv_personality:topup")
+
+            for entry in personality_entries:
+                if len(personality_songs) >= personality_target:
+                    break
+
+                trait = entry["trait"]
+                genre = entry["genre"]
+                remaining_trait_slots = max_per_trait - trait_limits[trait]
+                if remaining_trait_slots <= 0:
+                    continue
+
+                csv_added = False
+                if csv_provider and hasattr(csv_provider, "search_by_genres"):
+                    csv_matches = csv_provider.search_by_genres(
+                        [genre],
+                        max_results=remaining_trait_slots,
+                        trait_filters=[entry],
+                    )
+                    csv_matches = self._personalize_csv_matches(csv_matches or [], patient_unique_id)
+                    for match in csv_matches or []:
+                        if len(personality_songs) >= personality_target or trait_limits[trait] >= max_per_trait:
+                            break
+                        if add_personality_song(match, trait):
+                            trait_limits[trait] += 1
+                            csv_added = True
+                    if csv_added:
+                        personality_queries.append(f"{genre} (local_csv)")
+                        continue
+
+                genre_query = f"{genre} song"
+                songs = self.music_service.search_music(genre_query, max_results=remaining_trait_slots)
+                if songs:
+                    added_any = False
+                    for song in songs:
+                        if len(personality_songs) >= personality_target or trait_limits[trait] >= max_per_trait:
+                            break
+                        if add_personality_song(song, trait):
+                            added_any = True
+                            trait_limits[trait] += 1
+                    if added_any:
+                        personality_queries.append(f"{genre_query} ({trait})")
+                        print(f" Personality genre: {genre_query} - {len(songs)} songs")
+                else:
+                    print(f"  No results for: {genre_query}")
+
+
+            if len(personality_songs) < personality_target:
+                proven_queries = [
+                    "Piano song",
+                    "Spring song",
+                    "Rain song",
+                ]
+
+                for query in proven_queries:
+                    if len(personality_songs) >= personality_target:
+                        break
+
+                    songs = self.music_service.search_music(query, max_results=personality_target - len(personality_songs))
+                    if songs:
+                        added_any = False
+                        for song in songs:
+                            if len(personality_songs) >= personality_target:
+                                break
+                            if add_personality_song(song):
+                                added_any = True
+                        if added_any:
+                            personality_queries.append(query)
+                            print(f" Fallback query: {query} - {len(songs)} songs")
+                            break
+
+
+            if len(personality_songs) == 0:
+                print("  Using guaranteed fallback - generating genre-specific personality songs")
+                personality_songs = []
+                personality_queries = []
+                personality_song_ids.clear()
+
+
+                for entry in personality_entries[:5]:
+                    genre = entry["genre"]
+                    if len(personality_songs) >= personality_target:
+                        break
+
+                    genre_query = f"{genre} song"
+                    print(f"🎵 Searching music provider for: {genre_query}")
+                    api_songs = self.music_service.search_music(genre_query, max_results=1)
+
+                    if api_songs:
+                        if add_personality_song(api_songs[0], entry.get("trait")):
+                            print(f"   Found: {api_songs[0]['title']}")
+                    else:
+
+                        add_personality_song({
+                            "title": f"{genre} Music for {patient_info.get('name', 'Patient')} - Relaxing Melody",
+                            "description": f"Personalized {genre} music therapy. Please search for this type of music on your preferred platform."
+                        })
+                        print(f"   Using fallback for: {genre}")
+
+                    personality_queries.append(genre_query)
+
+            if len(personality_songs) < personality_target:
+                dominant_trait = max(big5_scores.items(), key=lambda item: item[1])[0]
+                for idx in range(len(personality_songs), personality_target):
+                    fallback_song = {
+                        "title": f"{dominant_trait.title()} Personality Focus #{idx + 1}",
+                        "description": "Placeholder suggestion—search for calming music aligned to this trait.",
+                        "channel": "TheraMuse Placeholder",
+                        "source": "personality_fallback",
+                    }
+                    add_personality_song(fallback_song, dominant_trait)
+                personality_queries.append("personality_placeholder")
+
+            if personality_songs:
+                display_genres = personality_display_genres or ["Soft Alternative"]
+                recommendations["categories"]["big5_scores_songs"] = {
+                    "query": f"{display_genres[0]} song.",
+                    "songs": personality_songs,
+                    "count": len(personality_songs),
+                    "personality_genres": display_genres
+                }
+                print(f" Big5 Scores Songs: {len(personality_songs)} songs generated from personality mapping")
+
+
+        total_songs = sum(category["count"] for category in recommendations["categories"].values())
+        recommendations["total_songs"] = total_songs
+        recommendations["method"] = "dementia_therapy_v2.1"
+        recommendations["generated_at"] = datetime.now().isoformat()
+        print(f"\n Generated {total_songs} total recommendations for Dementia/Alzheimer's therapy")
+        print(f"Categories: {list(recommendations['categories'].keys())}")
+        print("="*60 + "\n")
+
+        return make_json_safe(recommendations)
+
+
+class DownSyndromeTherapy:
+
+
+    def __init__(self):
+        self.music_service = MusicSearchService()
+        self.primary_queries = [
+            "Theta (4–8 Hz) brainwave entrainment",
+            "40 Hz Stimulation music",
+            "432 Hz Music",
+            "528 Hz Music",
+            "40–60 BPM rhythm",
+            "sensory integration music therapy",
+            "relaxing music for autism children"
+        ]
+
+
+    def get_down_syndrome_recommendations(self, patient_info: Dict = None) -> Dict:
+
+
+        print("\n" + "="*60)
+        print(" Generating Down Syndrome Therapy Recommendations...")
+        print("="*60)
+
+        recommendations = {
+            "patient_context": {
+                "condition": "down_syndrome",
+                "therapy_focus": "calming sensory music with theta waves and therapeutic frequencies"
+            },
+            "categories": {}
+        }
+
+
+        import time
+
+        for i, query in enumerate(self.primary_queries, 1):
+            print(f"🎵 [{i}/{len(self.primary_queries)}] Searching for: {query}")
+
+
+            time.sleep(0.5)
+
+            songs = self.music_service.search_music(query, max_results=5)
+
+
+            if not songs:
+                print(f"   No songs found, creating placeholder for: {query}")
+                fallback_songs = []
+                for j in range(5):
+                    fallback_song = {
+                        "title": f"Down Syndrome Therapy - {query} (Track {j+1})",
+                        "description": f"Calming sensory music for Down Syndrome therapy. Based on {query}. Please search for this music on your preferred platform.",
+                        "fallback": True
+                    }
+                    fallback_songs.append(fallback_song)
+                songs = fallback_songs
+                print(f"   Created {len(songs)} fallback songs")
+            else:
+                print(f"   Found {len(songs)} songs")
+
+
+            category_name = self._create_down_syndrome_category_name(query)
+
+
+            recommendations["categories"][category_name] = {
+                "query": query,
+                "songs": songs,
+                "count": len(songs),
+                "description": f"Down Syndrome therapy music: {query}",
+                "category_type": "primary_query"
+            }
+
+
+        total_songs = sum(category["count"] for category in recommendations["categories"].values())
+        recommendations["total_songs"] = total_songs
+        recommendations["method"] = "down_syndrome_therapy_v2"
+        recommendations["generated_at"] = datetime.now().isoformat()
+
+        print(f"\n Generated {total_songs} total recommendations for Down Syndrome therapy")
+        print(f" Focus: All primary Down Syndrome queries processed with guaranteed songs")
+        print(f"Categories: {list(recommendations['categories'].keys())}")
+        print("="*60 + "\n")
+
+        return recommendations
+
+    def _create_down_syndrome_category_name(self, query: str) -> str:
+
+
+        category_name = query.lower()
+
+
+        replacements = {
+            "theta (4–8 hz) brainwave entrainment": "theta_brainwave_4_8hz",
+            "40 hz stimulation music": "stimulation_40hz",
+            "432 hz music": "432hz_healing",
+            "528 hz music": "528hz_miracle",
+            "40–60 bpm rhythm": "rhythm_40_60bpm",
+            "sensory integration music therapy": "sensory_integration",
+            "relaxing music for autism children": "autism_relaxing"
+        }
+
+
+        for old, new in replacements.items():
+            if old.lower() in category_name:
+                category_name = new
+                break
+
+
+        import re
+        category_name = re.sub(r'[^a-z0-9_]', '_', category_name)
+
+        category_name = re.sub(r'_+', '_', category_name)
+
+        category_name = category_name.strip('_')
+
+        return category_name
+
+
+class ADHDTherapy:
+
+
+    def __init__(self):
+        self.music_service = MusicSearchService()
+        self.adhd_queries = [
+            "Alpha range (8–12 Hz) brainwave entrainment",
+            "40 Hz (Gamma–Beta border)",
+            "3333 Hz - Pure Binaural Beat Frequency",
+            "binaural beats focus 40 hz",
+            "barber beat music",
+            "Khruangbin",
+            "Vaporwave music",
+            "Hermanos Gutiérrez",
+            "estas tonne song",
+            "432 hz music",
+            "829 hz music",
+            "Pere Andre Farah",
+            "Classical Music to Make Your Brain Shut Up",
+            "Indian Classical – Raga Desh / Raga Bhairavi"
+        ]
+
+    def get_adhd_recommendations(self, patient_info: Dict = None) -> Dict:
+
+
+        print("\n" + "="*60)
+        print(" Generating ADHD Therapy Recommendations...")
+        print("="*60)
+
+        recommendations = {
+            "patient_context": {
+                "condition": "adhd",
+                "therapy_focus": "concentration, focus, attention enhancement with binaural beats"
+            },
+            "categories": {}
+        }
+
+
+        import time
+
+        for i, query in enumerate(self.adhd_queries, 1):
+            print(f"🎵 [{i}/{len(self.adhd_queries)}] Searching for: {query}")
+
+
+            time.sleep(0.5)
+
+            songs = self.music_service.search_music(query, max_results=5)
+
+
+            if not songs:
+                print(f"   No songs found, creating placeholder for: {query}")
+                fallback_songs = []
+                for j in range(5):
+                    fallback_song = {
+                        "title": f"ADHD Therapy Music - {query} (Track {j+1})",
+                        "description": f"Therapeutic music for ADHD concentration and focus. Based on {query}. Please search for this music on your preferred platform.",
+                        "fallback": True
+                    }
+                    fallback_songs.append(fallback_song)
+                songs = fallback_songs
+                print(f"   Created {len(songs)} fallback songs")
+            else:
+                print(f"   Found {len(songs)} songs")
+
+
+            category_name = self._create_category_name_from_query(query)
+
+
+            recommendations["categories"][category_name] = {
+                "query": query,
+                "songs": songs,
+                "count": len(songs),
+                "description": f"ADHD therapy music: {query}",
+                "category_type": "primary_query"
+            }
+
+
+        total_songs = sum(category["count"] for category in recommendations["categories"].values())
+        recommendations["total_songs"] = total_songs
+        recommendations["method"] = "adhd_therapy_v2"
+        recommendations["generated_at"] = datetime.now().isoformat()
+
+        print(f"\n Generated {total_songs} total recommendations for ADHD therapy")
+        print(f" Focus: All primary ADHD queries processed with guaranteed songs")
+        print(f"Categories: {list(recommendations['categories'].keys())}")
+        print("="*60 + "\n")
+
+        return recommendations
+
+    def _create_category_name_from_query(self, query: str) -> str:
+
+
+        category_name = query.lower()
+
+
+        replacements = {
+            "alpha range (8–12 hz) brainwave entrainment": "alpha_brainwave_entrainment",
+            "40 hz (gamma–beta border)": "gamma_beta_border_40hz",
+            "3333 hz - pure binaural beat frequency": "pure_binaural_3333hz",
+            "binaural beats focus 40 hz": "binaural_focus_40hz",
+            "barber beat music": "barber_beat_music",
+            "khruangbin": "khruangbin_music",
+            "vaporwave music": "vaporwave_focus",
+            "hermanos gutiérrez": "hermanos_gutierrez",
+            "estas tonne song": "estas_tonne_guitar",
+            "432 hz music": "432hz_healing",
+            "829 hz music": "829hz_therapy",
+            "pere andre farah": "pere_andre_farah",
+            "classical music to make your brain shut up": "classical_brain_focus",
+            "indian classical – raga desh / raga bhairavi": "indian_classical_ragas"
+        }
+
+
+        for old, new in replacements.items():
+            if old.lower() in category_name:
+                category_name = new
+                break
+
+
+        import re
+        category_name = re.sub(r'[^a-z0-9_]', '_', category_name)
+
+        category_name = re.sub(r'_+', '_', category_name)
+
+        category_name = category_name.strip('_')
+
+        return category_name
+
+
+class LinearThompsonSampling:
+
+
+    def __init__(self, n_features: int = 20, alpha: float = 1.0, lambda_reg: float = 1.0):
+        self.n_features = n_features
+        self.alpha = alpha
+        self.lambda_reg = lambda_reg
+
+
+        self.B = np.identity(n_features) * lambda_reg
+        self.mu = np.zeros(n_features)
+        self.f = np.zeros(n_features)
+
+
+        self.n_interactions = 0
+        self.total_reward = 0.0
+
+    def sample_theta(self) -> np.ndarray:
+
+        try:
+            B_inv = np.linalg.inv(self.B)
+            self.mu = B_inv @ self.f
+            theta_sample = np.random.multivariate_normal(self.mu, self.alpha * B_inv)
+            return theta_sample
+        except np.linalg.LinAlgError:
+            return self.mu + np.random.randn(self.n_features) * 0.1
+
+    def predict(self, context: np.ndarray, theta: np.ndarray = None) -> float:
+
+        if theta is None:
+            theta = self.mu
+        return np.dot(theta, context)
+
+    def update(self, context: np.ndarray, reward: float, decay_factor: float = 0.98):
+
+
+        self.B *= decay_factor
+        self.f *= decay_factor
+
+
+        self.B += np.outer(context, context)
+        self.f += reward * context
+
+        self.n_interactions += 1
+        self.total_reward += reward
+
+    def get_average_reward(self) -> float:
+
+        if self.n_interactions == 0:
+            return 0.0
+        return self.total_reward / self.n_interactions
+
+
+class DatabaseManager:
+
+    def __init__(self, database: Optional[str] = None):
+        self.database = database or MYSQL_DATABASE
+        self.conn = None
+        self._table_columns_cache: Dict[str, Set[str]] = {}
+        self._csv_fallback_cache: Optional[List[Dict[str, Any]]] = None
+        self._csv_path = os.getenv(
+            "NOSTALGIA_CSV_PATH",
+            "/home/spectre-rosamund/CVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV/d.csv",
+        )
+        self._csv_warned_location = False
+        self.connect()
+        self.create_tables()
+
+    def connect(self):
+        if self.conn:
+            try:
+                self.conn.close()
+            except mysql.connector.Error:
+                pass
+        self.conn = connect_to_mysql(self.database)
+        self.conn.autocommit = False
+
+    def create_tables(self):
+        cursor = self.conn.cursor()
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS therapy_sessions (
+                session_id VARCHAR(64) PRIMARY KEY,
+                patient_id VARCHAR(64) NOT NULL,
+                `condition` VARCHAR(64) NOT NULL,
+                therapy_method VARCHAR(255),
+                total_songs INT,
+                exploration_rate DOUBLE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_sessions_patient (patient_id),
+                INDEX idx_sessions_condition (`condition`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS therapy_recommendations (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                session_id VARCHAR(64) NOT NULL,
+                patient_id VARCHAR(64) NOT NULL,
+                category VARCHAR(255) NOT NULL,
+                query TEXT,
+                song_title VARCHAR(255),
+                video_id VARCHAR(128),
+                channel VARCHAR(255),
+                description TEXT,
+                `rank` INT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_recs_session (session_id),
+                INDEX idx_recs_patient (patient_id),
+                CONSTRAINT fk_recs_session FOREIGN KEY (session_id)
+                    REFERENCES therapy_sessions(session_id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS therapy_feedback (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                patient_id VARCHAR(64) NOT NULL,
+                session_id VARCHAR(64),
+                `condition` VARCHAR(64) NOT NULL,
+                song_title VARCHAR(255),
+                video_id VARCHAR(128),
+                reward DOUBLE NOT NULL,
+                feedback_type VARCHAR(64),
+                context_features TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_feedback_patient (patient_id),
+                INDEX idx_feedback_session (session_id),
+                INDEX idx_feedback_condition (`condition`),
+                CONSTRAINT fk_feedback_session FOREIGN KEY (session_id)
+                    REFERENCES therapy_sessions(session_id) ON DELETE SET NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bandit_stats (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                `condition` VARCHAR(64) NOT NULL,
+                n_interactions INT,
+                total_reward DOUBLE,
+                avg_reward DOUBLE,
+                exploration_rate DOUBLE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_bandit_condition (`condition`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS patients (
+                patient_id VARCHAR(64) PRIMARY KEY,
+                name VARCHAR(255),
+                age INT,
+                birth_year INT,
+                `condition` VARCHAR(64),
+                patient_info TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS big5_scores (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                patient_id VARCHAR(64),
+                session_id VARCHAR(64),
+                openness DOUBLE,
+                conscientiousness DOUBLE,
+                extraversion DOUBLE,
+                agreeableness DOUBLE,
+                neuroticism DOUBLE,
+                reinforcement_learning INT DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_big5_patient (patient_id),
+                INDEX idx_big5_session (session_id),
+                CONSTRAINT fk_big5_patient FOREIGN KEY (patient_id)
+                    REFERENCES patients(patient_id) ON DELETE SET NULL,
+                CONSTRAINT fk_big5_session FOREIGN KEY (session_id)
+                    REFERENCES therapy_sessions(session_id) ON DELETE SET NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+            """
+        )
+
+        self.conn.commit()
+        cursor.close()
+
+    def _parse_csv_release(self, raw_value: str) -> Optional[str]:
+        raw_value = (raw_value or "").strip()
+        if not raw_value:
+            return None
+
+        formats = [
+            "%Y-%m-%d",
+            "%m/%d/%Y",
+            "%d/%m/%Y",
+            "%Y/%m/%d",
+            "%d-%m-%Y",
+            "%Y",
+        ]
+
+        for fmt in formats:
+            try:
+                parsed = datetime.strptime(raw_value, fmt)
+                if fmt == "%Y":
+                    return f"{parsed.year}-01-01"
+                return parsed.strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+
+        digits_only = "".join(ch for ch in raw_value if ch.isdigit())
+        if len(digits_only) == 4:
+            return f"{digits_only}-01-01"
+        return None
+
+    def _load_csv_fallback(self) -> List[Dict[str, Any]]:
+        if self._csv_fallback_cache is not None:
+            return self._csv_fallback_cache
+
+        csv_path = (self._csv_path or "").strip()
+        if not csv_path:
+            self._csv_fallback_cache = []
+            return self._csv_fallback_cache
+
+        csv_file = Path(csv_path).expanduser()
+        if not csv_file.exists():
+            print(f"ℹ️  Nostalgia CSV fallback not found at {csv_file}")
+            self._csv_fallback_cache = []
+            return self._csv_fallback_cache
+
+        dataset: List[Dict[str, Any]] = []
+        seen: Set[Tuple[str, str]] = set()
+
+        try:
+            with csv_file.open(newline="", encoding="utf-8") as handle:
+                reader = csv.DictReader(handle)
+                for row in reader:
+                    song_name = (row.get("song_name") or "").strip()
+                    if not song_name:
+                        continue
+
+                    artist_name = (row.get("singer") or "").strip()
+                    dedupe_key = (song_name.lower(), artist_name.lower())
+                    if dedupe_key in seen:
+                        continue
+                    seen.add(dedupe_key)
+
+                    release_value = self._parse_csv_release(row.get("released_date") or "")
+                    release_year = None
+                    if release_value:
+                        try:
+                            release_year = int(release_value[:4])
+                        except ValueError:
+                            release_year = None
+
+                    dataset.append(
+                        {
+                            "song_name": song_name,
+                            "artist_name": artist_name or None,
+                            "release_value": release_value,
+                            "release_year": release_year,
+                            "genre": (row.get("genre") or "").strip() or None,
+                            "language": (row.get("language") or "").strip() or None,
+                        }
+                    )
+
+            print(f"ℹ️  Loaded {len(dataset)} fallback songs from CSV at {csv_file}")
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            print(f"⚠️  Failed to load nostalgia CSV fallback: {exc}")
+            dataset = []
+
+        self._csv_fallback_cache = dataset
+        return dataset
+
+    def _get_csv_fallback_rows(
+        self,
+        city: Optional[str],
+        start_year: Optional[int],
+        end_year: Optional[int],
+        limit: int,
+    ) -> List[Dict]:
+        dataset = self._load_csv_fallback()
+        if not dataset:
+            return []
+
+        if city and not self._csv_warned_location:
+            print("ℹ️  CSV fallback dataset lacks city metadata; returning general songs.")
+            self._csv_warned_location = True
+
+        results: List[Dict[str, Any]] = []
+        start: Optional[int] = None
+        end: Optional[int] = None
+        if start_year is not None and end_year is not None:
+            start, end = sorted([start_year, end_year])
+
+        for row in dataset:
+            release_year = row.get("release_year")
+            if (
+                start is not None
+                and end is not None
+                and release_year is not None
+                and not (start <= release_year <= end)
+            ):
+                    continue
+
+            results.append(
+                {
+                    "song_name": row.get("song_name"),
+                    "artist_name": row.get("artist_name"),
+                    "release_value": row.get("release_value"),
+                    "genre": row.get("genre"),
+                }
+            )
+
+            if len(results) >= limit:
+                break
+
+        return results
+
+    def _table_exists(self, table: str) -> bool:
+        cache_key = f"table_exists::{table}"
+        if cache_key in self._table_columns_cache:
+            return True
+
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(
+                """
+                SELECT COUNT(*)
+                FROM information_schema.tables
+                WHERE table_schema = DATABASE() AND table_name = %s
+                """,
+                (table,),
+            )
+            exists = cursor.fetchone()[0] > 0
+            if exists:
+                self._table_columns_cache[cache_key] = set()
+            return exists
+        except mysql.connector.Error:
+            return False
+        finally:
+            cursor.close()
+
+    def _get_table_columns(self, table: str) -> Set[str]:
+        if table in self._table_columns_cache:
+            return self._table_columns_cache[table]
+
+        if not self._table_exists(table):
+            return set()
+
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(f"SHOW COLUMNS FROM `{table}`")
+            columns = {row[0] for row in cursor.fetchall()}
+            self._table_columns_cache[table] = columns
+            return columns
+        except mysql.connector.Error:
+            return set()
+        finally:
+            cursor.close()
+
+    def get_songs_for_nostalgia_window(
+        self,
+        city: Optional[str],
+        start_year: Optional[int],
+        end_year: Optional[int],
+        limit: int = 20,
+    ) -> List[Dict]:
+        fallback = lambda: self._get_csv_fallback_rows(city, start_year, end_year, limit)
+
+        if not self._table_exists("songs"):
+            return fallback()
+
+        song_columns = self._get_table_columns("songs")
+        if not song_columns:
+            return fallback()
+
+        select_parts = ["s.song_name AS song_name"]
+        join_clause = ""
+        singer_columns: Set[str] = set()
+
+        if "singer_id" in song_columns and self._table_exists("singers"):
+            singer_columns = self._get_table_columns("singers")
+            select_parts.append("sg.singer_name AS artist_name")
+            join_clause = "LEFT JOIN singers sg ON sg.singer_id = s.singer_id"
+        elif "singer" in song_columns:
+            select_parts.append("s.singer AS artist_name")
+        else:
+            select_parts.append("NULL AS artist_name")
+
+        release_column = None
+        release_year_column = None
+        for candidate in ("released_date", "release_date"):
+            if candidate in song_columns:
+                release_column = candidate
+                break
+        if not release_column and "release_year" in song_columns:
+            release_year_column = "release_year"
+
+        if release_column:
+            select_parts.append(f"s.{release_column} AS release_value")
+        elif release_year_column:
+            select_parts.append(f"s.{release_year_column} AS release_value")
+        else:
+            select_parts.append("NULL AS release_value")
+
+        conditions = []
+        params: List[Any] = []
+
+        if start_year and end_year and (release_column or release_year_column):
+            start, end = sorted([start_year, end_year])
+            if release_column:
+                conditions.append(f"s.{release_column} BETWEEN %s AND %s")
+                params.extend([f"{start}-01-01", f"{end}-12-31"])
+            else:
+                conditions.append(f"s.{release_year_column} BETWEEN %s AND %s")
+                params.extend([start, end])
+
+        if city:
+            city_filters = []
+            like_value = f"%{city}%"
+            for column in song_columns:
+                if "city" in column.lower():
+                    city_filters.append(f"s.`{column}` LIKE %s")
+            for column in singer_columns:
+                lowered = column.lower()
+                if "city" in lowered or "hometown" in lowered or "birthplace" in lowered:
+                    city_filters.append(f"sg.`{column}` LIKE %s")
+            if city_filters:
+                conditions.append("(" + " OR ".join(city_filters) + ")")
+                params.extend([like_value] * len(city_filters))
+
+        where_clause = ""
+        if conditions:
+            where_clause = "WHERE " + " AND ".join(conditions)
+
+        order_clause = "s.song_name ASC"
+        if release_column:
+            order_clause = f"s.{release_column} DESC"
+        elif release_year_column:
+            order_clause = f"s.{release_year_column} DESC"
+
+        query = f"""
+            SELECT {", ".join(select_parts)}
+            FROM songs s
+            {join_clause}
+            {where_clause}
+            ORDER BY {order_clause}
+            LIMIT %s
+        """
+        params.append(limit)
+
+        cursor = self.conn.cursor(dictionary=True)
+        try:
+            cursor.execute(query, params)
+            results = cursor.fetchall() or []
+            if results:
+                return results
+        except mysql.connector.Error as exc:
+            print(f"⚠️  Error fetching nostalgia songs: {exc}")
+        finally:
+            cursor.close()
+
+        return fallback()
+
+    def save_session(
+        self,
+        session_id: str,
+        patient_id: str,
+        condition: str,
+        therapy_method: str,
+        total_songs: int,
+        exploration_rate: float,
+    ):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO therapy_sessions (session_id, patient_id, `condition`, therapy_method, total_songs, exploration_rate)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                patient_id = VALUES(patient_id),
+                `condition` = VALUES(`condition`),
+                therapy_method = VALUES(therapy_method),
+                total_songs = VALUES(total_songs),
+                exploration_rate = VALUES(exploration_rate)
+            """,
+            (
+                session_id,
+                patient_id,
+                condition,
+                therapy_method,
+                total_songs,
+                exploration_rate,
+            ),
+        )
+        self.conn.commit()
+        cursor.close()
+
+    def save_recommendations(self, session_id: str, patient_id: str, recommendations: Dict):
+        cursor = self.conn.cursor()
+
+        for category_name, category_data in recommendations.get("categories", {}).items():
+            songs = category_data.get("songs", [])
+            for rank, song in enumerate(songs, 1):
+                video_id = None
+                if isinstance(song.get("id"), dict):
+                    video_id = song.get("id", {}).get("videoId")
+                else:
+                    video_id = song.get("id")
+
+                cursor.execute(
+                    """
+                    INSERT INTO therapy_recommendations
+                    (session_id, patient_id, category, query, song_title, video_id, channel, description, `rank`)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        str(session_id),
+                        str(patient_id),
+                        str(category_name),
+                        str(category_data.get("query", "")),
+                        str(song.get("title", "")),
+                        str(video_id) if video_id else None,
+                        str(song.get("channel", "")),
+                        str(song.get("description", ""))[:500],
+                        int(rank),
+                    ),
+                )
+
+        self.conn.commit()
+        cursor.close()
+
+    def save_feedback(
+        self,
+        patient_id: str,
+        session_id: str,
+        condition: str,
+        song: Dict,
+        reward: float,
+        feedback_type: str,
+        context_features: List[float],
+    ):
+        cursor = self.conn.cursor()
+
+        video_id = None
+        if isinstance(song.get("id"), dict):
+            video_id = song.get("id", {}).get("videoId")
+        else:
+            video_id = song.get("id")
+
+        cursor.execute(
+            """
+            INSERT INTO therapy_feedback
+            (patient_id, session_id, `condition`, song_title, video_id, reward, feedback_type, context_features)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                str(patient_id),
+                str(session_id),
+                str(condition),
+                str(song.get("title", "")),
+                str(video_id) if video_id else None,
+                float(reward),
+                str(feedback_type),
+                json.dumps(context_features),
+            ),
+        )
+        self.conn.commit()
+        cursor.close()
+
+    def save_patient(self, patient_id: str, patient_info: Dict):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO patients (patient_id, name, age, birth_year, `condition`, patient_info)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                name = VALUES(name),
+                age = VALUES(age),
+                birth_year = VALUES(birth_year),
+                `condition` = VALUES(`condition`),
+                patient_info = VALUES(patient_info)
+            """,
+            (
+                patient_id,
+                patient_info.get("name"),
+                patient_info.get("age"),
+                patient_info.get("birth_year"),
+                patient_info.get("condition"),
+                json.dumps(patient_info),
+            ),
+        )
+        self.conn.commit()
+        cursor.close()
+
+    def save_big5_scores(self, session_id: str, patient_id: str, scores: Dict[str, Any]):
+        if not scores:
+            return
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO big5_scores (
+                patient_id, session_id, openness, conscientiousness, extraversion,
+                agreeableness, neuroticism, reinforcement_learning
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, 0)
+            """,
+            (
+                patient_id,
+                session_id,
+                float(scores.get("openness") or 0),
+                float(scores.get("conscientiousness") or 0),
+                float(scores.get("extraversion") or 0),
+                float(scores.get("agreeableness") or 0),
+                float(scores.get("neuroticism") or 0),
+            ),
+        )
+        self.conn.commit()
+        cursor.close()
+
+    def get_latest_big5_scores(self, patient_id: str) -> Optional[Dict[str, Any]]:
+        cursor = self.conn.cursor(dictionary=True)
+        cursor.execute(
+            """
+            SELECT openness, conscientiousness, extraversion, agreeableness, neuroticism
+            FROM big5_scores
+            WHERE patient_id = %s
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (patient_id,),
+        )
+        row = cursor.fetchone()
+        cursor.close()
+        return row
+
+    def get_recent_personality_song_ids(self, patient_id: str, limit: int = 40) -> List[str]:
+        limit_value = max(1, min(int(limit), 200))
+        cursor = self.conn.cursor(dictionary=True)
+        cursor.execute(
+            f"""
+            SELECT video_id, song_title, channel
+            FROM therapy_recommendations
+            WHERE patient_id = %s AND category = %s
+            ORDER BY created_at DESC
+            LIMIT {limit_value}
+            """,
+            (patient_id, "big5_scores_songs"),
+        )
+        rows = cursor.fetchall() or []
+        cursor.close()
+
+        seen_ids: List[str] = []
+        for row in rows:
+            video_id = row.get("video_id")
+            if video_id:
+                seen_ids.append(str(video_id))
+                continue
+            title = row.get("song_title") or ""
+            channel = row.get("channel") or ""
+            key = f"{title}::{channel}".strip(":")
+            if key:
+                seen_ids.append(key)
+        return seen_ids
+
+    def get_analytics(self) -> Dict:
+        cursor = self.conn.cursor(dictionary=True)
+
+        cursor.execute("SELECT COUNT(*) AS count FROM therapy_sessions")
+        total_sessions = cursor.fetchone()["count"]
+
+        cursor.execute("SELECT COUNT(*) AS count FROM therapy_feedback")
+        total_feedback = cursor.fetchone()["count"]
+
+        cursor.execute("SELECT COUNT(DISTINCT patient_id) AS count FROM patients")
+        total_patients = cursor.fetchone()["count"]
+
+        cursor.execute(
+            """
+            SELECT `condition` AS condition, AVG(reward) AS avg_reward, COUNT(*) AS count
+            FROM therapy_feedback
+            GROUP BY `condition`
+            """
+        )
+        rewards_by_condition = cursor.fetchall()
+        cursor.close()
+
+        return {
+            "total_sessions": total_sessions,
+            "total_feedback": total_feedback,
+            "total_patients": total_patients,
+            "rewards_by_condition": rewards_by_condition,
+        }
+
+    def close(self):
+        if self.conn:
+            try:
+                self.conn.close()
+            except mysql.connector.Error:
+                pass
+
+
+class TheraMuse:
+
+    def __init__(self, model_path: str = "theramuse_model.pkl", db_path: Optional[str] = None):
+
+        print("\n" + "" * 30)
+        print("Initializing TheraMuse v9.0 - Synchronized Build")
+        print("" * 30 + "\n")
+
+        self.model_path = model_path
+
+        database_override = None
+        if db_path:
+            if db_path.endswith(".db"):
+                print("⚠️  Legacy SQLite db_path detected; using configured MySQL database instead.")
+            else:
+                database_override = db_path
+
+        self.db = DatabaseManager(database=database_override)
+
+
+        self.dementia_therapy = DementiaTherapy(self.db)
+        self.down_syndrome_therapy = DownSyndromeTherapy()
+        self.adhd_therapy = ADHDTherapy()
+
+
+        self.music_service = MusicSearchService()
+        self._csv_provider: Optional[LocalMusicDataset] = getattr(self.music_service, "_provider", None)
+
+
+        self.bandits = {
+            "dementia": LinearThompsonSampling(),
+            "down_syndrome": LinearThompsonSampling(),
+            "adhd": LinearThompsonSampling()
+        }
+
+
+        self.exploration_rate = 0.3
+        self.min_exploration_rate = 0.1
+
+
+        self._load_model()
+
+        print(" TheraMuse initialized successfully!\n")
+
+    def _get_csv_provider(self) -> Optional[LocalMusicDataset]:
+        if self._csv_provider:
+            return self._csv_provider
+
+        provider = getattr(self.music_service, "_provider", None)
+        if provider:
+            self._csv_provider = provider
+            return provider
+
+        therapy_services = [
+            getattr(self, "dementia_therapy", None),
+            getattr(self, "down_syndrome_therapy", None),
+            getattr(self, "adhd_therapy", None),
+        ]
+        for therapy in therapy_services:
+            service = getattr(therapy, "music_service", None)
+            provider = getattr(service, "_provider", None)
+            if provider:
+                self._csv_provider = provider
+                return provider
+        return None
+
+    def _attach_csv_preference_matches(self, recommendations: Dict, patient_info: Dict) -> None:
+        provider = self._get_csv_provider()
+        if not provider or not hasattr(provider, "search_by_patient_preferences"):
+            return
+
+        matches = provider.search_by_patient_preferences(patient_info, max_results=8)
+        if not matches:
+            return
+
+        categories = recommendations.setdefault("categories", {})
+        categories["patient_csv_matches"] = {
+            "query": "local_csv_preferences",
+            "songs": matches,
+            "count": len(matches),
+            "description": "Matches from curated CSV catalogue based on patient inputs",
+        }
+        recommendations["total_songs"] = (recommendations.get("total_songs") or 0) + len(matches)
+
+    def _big5_scores_changed(self, previous: Optional[Dict[str, Any]], current: Optional[Dict[str, Any]], threshold: float = 0.3) -> bool:
+        if not current:
+            return False
+        if not previous:
+            return True
+        traits = ("openness", "conscientiousness", "extraversion", "agreeableness", "neuroticism")
+        for trait in traits:
+            prev_val = float(previous.get(trait) or 0)
+            curr_val = float(current.get(trait) or 0)
+            if abs(prev_val - curr_val) >= threshold:
+                return True
+        return False
+
+    def extract_context_features(self, patient_info: Dict, condition: str) -> np.ndarray:
+
+
+        features = np.zeros(20)
+
+
+        condition_map = {"dementia": 0, "down_syndrome": 1, "adhd": 2}
+        if condition in condition_map:
+            features[condition_map[condition]] = 1.0
+
+
+        if "age" in patient_info:
+            features[4] = patient_info["age"] / 100.0
+
+
+        if condition == "dementia":
+            features[5] = float(patient_info.get("difficulty_sleeping", False))
+            features[6] = float(patient_info.get("trouble_remembering", False))
+            features[7] = float(patient_info.get("forgets_everyday_things", False))
+            features[8] = float(patient_info.get("difficulty_recalling_old_memories", False))
+            features[9] = float(patient_info.get("memory_worse_than_year_ago", False))
+
+
+        if "big5_scores" in patient_info:
+            big5 = patient_info["big5_scores"]
+            features[10] = big5.get("openness", 4) / 7.0
+            features[11] = big5.get("conscientiousness", 4) / 7.0
+            features[12] = big5.get("extraversion", 4) / 7.0
+            features[13] = big5.get("agreeableness", 4) / 7.0
+            features[14] = big5.get("neuroticism", 4) / 7.0
+
+
+        hour = datetime.now().hour
+        features[15] = hour / 24.0
+
+
+        if "instruments" in patient_info:
+            features[16] = min(len(patient_info["instruments"]), 5) / 5.0
+        if "natural_elements" in patient_info:
+            features[17] = min(len(patient_info["natural_elements"]), 5) / 5.0
+
+        return features
+
+    def get_therapy_recommendations(self, patient_info: Dict, condition: str,
+                                   patient_id: str = None) -> Dict:
+
+
+        session_id = f"therapy_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+
+
+        big5_scores = patient_info.get("big5_scores")
+        previous_big5 = None
+        big5_changed = False
+        seen_personality_ids: List[str] = []
+        if patient_id and big5_scores:
+            previous_big5 = self.db.get_latest_big5_scores(patient_id)
+            big5_changed = self._big5_scores_changed(previous_big5, big5_scores)
+            if big5_changed:
+                seen_personality_ids = self.db.get_recent_personality_song_ids(patient_id, limit=50)
+
+
+        if patient_id:
+            self.db.save_patient(patient_id, patient_info)
+            patient_info["_theramuse_patient_id"] = patient_id
+
+
+        if big5_scores:
+            patient_info["_big5_previous_scores"] = previous_big5
+            patient_info["_big5_changed"] = big5_changed
+            if big5_changed and seen_personality_ids:
+                patient_info["_seen_personality_song_ids"] = seen_personality_ids
+
+
+        if condition == "dementia":
+            recommendations = self.dementia_therapy.get_dementia_recommendations(patient_info)
+        elif condition == "down_syndrome":
+            recommendations = self.down_syndrome_therapy.get_down_syndrome_recommendations(patient_info)
+        elif condition == "adhd":
+            recommendations = self.adhd_therapy.get_adhd_recommendations(patient_info)
+        else:
+            raise ValueError(f"Unknown condition: {condition}")
+
+        self._attach_csv_preference_matches(recommendations, patient_info)
+
+        bandit = self.bandits[condition]
+        recommendations["bandit_stats"] = {
+            "n_interactions": bandit.n_interactions,
+            "avg_reward": bandit.get_average_reward(),
+            "exploration_rate": self.exploration_rate
+        }
+
+
+        recommendations["session_id"] = session_id
+        recommendations["patient_id"] = patient_id
+        recommendations["condition"] = condition
+
+
+        if patient_id:
+            self.db.save_session(
+                session_id, patient_id, condition,
+                recommendations["method"], recommendations["total_songs"],
+                self.exploration_rate
+            )
+            self.db.save_recommendations(session_id, patient_id, recommendations)
+            if big5_scores:
+                self.db.save_big5_scores(session_id, patient_id, big5_scores)
+
+
+        try:
+            self._export_recommendations_json(recommendations)
+        except Exception as e:
+
+            print(f"  Failed to export recommendations JSON: {e}")
+
+        return recommendations
+
+    def _export_recommendations_json(self, recommendations: Dict) -> Optional[Path]:
+
+
+        base_dir = Path(__file__).resolve().parent
+
+        data_dir = base_dir / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+
+        condition = recommendations.get("condition", "unknown")
+        ts = datetime.now().strftime("%Y%m%d%H%M%S")
+        day = datetime.now().strftime("%Y%m%d")
+        fname = f"theramuse_recommendations_{condition}_{ts}_{day}.json"
+        fpath = data_dir / fname
+
+
+        if "generated_at" not in recommendations:
+            recommendations["generated_at"] = datetime.now().isoformat()
+
+        safe_payload = make_json_safe(recommendations)
+        try:
+            with open(fpath, "w", encoding="utf-8") as f:
+                json.dump(safe_payload, f, ensure_ascii=False, indent=2)
+
+            print(f" Exported recommendations JSON → {fpath}")
+            return fpath
+        except PermissionError:
+
+            import os
+            cwd = Path(os.getcwd())
+            fpath = cwd / fname
+            with open(fpath, "w", encoding="utf-8") as f:
+                json.dump(safe_payload, f, ensure_ascii=False, indent=2)
+            print(f" Exported recommendations JSON (fallback) → {fpath}")
+            return fpath
+
+    def record_feedback(self, patient_id: str, session_id: str, condition: str,
+                       song: Dict, feedback_type: str, patient_info: Dict = None):
+
+
+        reward_map = {"like": 1.0, "neutral": 0.0, "dislike": -1.0, "skip": -0.5, "inappropriate": -1.0}
+        reward = reward_map.get(feedback_type.lower(), 0.0)
+
+
+        if patient_info:
+            context = self.extract_context_features(patient_info, condition)
+        else:
+            context = np.zeros(20)
+
+
+        self.bandits[condition].update(context, reward)
+
+
+        self.db.save_feedback(
+            patient_id, session_id, condition, song, reward,
+            feedback_type, context.tolist()
+        )
+
+
+        self._update_reinforcement_learning_count(patient_id, session_id, feedback_type)
+
+
+        bandit = self.bandits[condition]
+        cursor = self.db.conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO bandit_stats (`condition`, n_interactions, total_reward, avg_reward, exploration_rate)
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            (
+                condition,
+                bandit.n_interactions,
+                bandit.total_reward,
+                bandit.get_average_reward(),
+                self.exploration_rate,
+            ),
+        )
+        self.db.conn.commit()
+        cursor.close()
+
+
+        if bandit.n_interactions > 50:
+            self.exploration_rate = max(
+                self.min_exploration_rate,
+                self.exploration_rate * (50 / bandit.n_interactions)
+            )
+
+        print(f" Enhanced Feedback Recorded: {feedback_type} (reward={reward:.2f}), total interactions: {bandit.n_interactions}")
+
+    def _update_reinforcement_learning_count(
+        self, patient_id: str, session_id: str, feedback_type: str
+    ):
+
+        try:
+            cursor = self.db.conn.cursor()
+            cursor.execute(
+                """
+                SELECT id, reinforcement_learning
+                FROM big5_scores
+                WHERE patient_id = %s AND session_id = %s
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (patient_id, session_id),
+            )
+
+            result = cursor.fetchone()
+            if not result:
+                cursor.close()
+                return
+
+            record_id, current_count = result
+            current_count = current_count or 0
+
+            increment = 1
+            if feedback_type.lower() == "like":
+                increment = 2
+
+            new_count = current_count + increment
+
+            cursor.execute(
+                "UPDATE big5_scores SET reinforcement_learning = %s WHERE id = %s",
+                (new_count, record_id),
+            )
+            self.db.conn.commit()
+            cursor.close()
+
+            print(f"  Reinforcement Learning Updated: Patient {patient_id}, Session {session_id}")
+            print(f"  Feedback Type: {feedback_type}, Increment: {increment}, New Total: {new_count}")
+
+        except mysql.connector.Error as e:
+            print(f"  Database error updating reinforcement learning: {e}")
+        except Exception as e:
+            print(f"  Error updating reinforcement learning: {e}")
+
+    def get_reinforcement_learning_stats(self, patient_id: str = None) -> Dict:
+
+        try:
+            cursor = self.db.conn.cursor(dictionary=True)
+
+            if patient_id:
+                cursor.execute(
+                    """
+                    SELECT patient_id, session_id, reinforcement_learning,
+                           openness, conscientiousness, extraversion, agreeableness, neuroticism,
+                           created_at
+                    FROM big5_scores
+                    WHERE patient_id = %s
+                    ORDER BY created_at DESC
+                    """,
+                    (patient_id,),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT patient_id, session_id, reinforcement_learning,
+                           openness, conscientiousness, extraversion, agreeableness, neuroticism,
+                           created_at
+                    FROM big5_scores
+                    WHERE reinforcement_learning > 0
+                    ORDER BY reinforcement_learning DESC, created_at DESC
+                    LIMIT 50
+                    """
+                )
+
+            results = cursor.fetchall()
+            cursor.close()
+
+            stats = []
+            for row in results:
+                stats.append(
+                    {
+                        "patient_id": row["patient_id"],
+                        "session_id": row["session_id"],
+                        "reinforcement_learning_count": row["reinforcement_learning"],
+                        "openness": row["openness"],
+                        "conscientiousness": row["conscientiousness"],
+                        "extraversion": row["extraversion"],
+                        "agreeableness": row["agreeableness"],
+                        "neuroticism": row["neuroticism"],
+                        "created_at": row["created_at"],
+                    }
+                )
+
+            return {
+                "reinforcement_learning_stats": stats,
+                "total_patients_with_rl": len({s["patient_id"] for s in stats}),
+                "total_feedback_interactions": sum(
+                    s["reinforcement_learning_count"] for s in stats
+                ),
+            }
+
+        except mysql.connector.Error as e:
+            print(f"Error getting reinforcement learning stats: {e}")
+            return {
+                "reinforcement_learning_stats": [],
+                "total_patients_with_rl": 0,
+                "total_feedback_interactions": 0,
+            }
+
+    def get_analytics(self) -> Dict:
+
+        return self.db.get_analytics()
+
+    def _load_model(self):
+
+        try:
+            if Path(self.model_path).exists():
+                with open(self.model_path, "rb") as f:
+                    model_data = pickle.load(f)
+
+                    if "bandits" in model_data:
+                        self.bandits = model_data["bandits"]
+                    if "exploration_rate" in model_data:
+                        self.exploration_rate = model_data["exploration_rate"]
+                print(f" Model loaded from {self.model_path}")
+        except Exception as e:
+            print(f"ℹ  No existing model found. Starting fresh.")
+
+    def _save_model(self):
+
+        try:
+            model_data = {
+                "bandits": self.bandits,
+                "exploration_rate": self.exploration_rate,
+                "saved_at": datetime.now().isoformat()
+            }
+            with open(self.model_path, "wb") as f:
+                pickle.dump(model_data, f)
+            print(f" Model saved to {self.model_path}")
+        except Exception as e:
+            print(f"  Error saving model: {e}")
+
+    def clear_music_cache(self):
+
+        if hasattr(self, 'music_service'):
+            self.music_service.clear_cache()
+            print(" Music recommendation cache cleared for fresh recommendations")
+
+    def get_music_cache_status(self) -> Dict:
+
+        if hasattr(self, 'music_service'):
+            return {
+                "cache_size": self.music_service.get_cache_size(),
+                "query_history_size": len(self.music_service._query_history)
+            }
+        return {"cache_size": 0, "query_history_size": 0}
+
+    def check_api_health(self) -> Dict:
+
+        health_status = {
+            "timestamp": datetime.now().isoformat(),
+            "music_service": self.music_service.get_api_health_status(),
+            "query_generator": {
+                "status": "static",
+                "provider": "BangladeshiSingerQueryGenerator"
+            },
+            "database": self._check_database_health()
+        }
+        return health_status
+
+    def _check_database_health(self) -> Dict:
+
+        try:
+            cursor = self.db.conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM therapy_sessions")
+            session_count = cursor.fetchone()[0]
+
+            cursor.execute("SELECT COUNT(*) FROM therapy_recommendations")
+            rec_count = cursor.fetchone()[0]
+
+            return {
+                "status": "healthy",
+                "sessions_count": session_count,
+                "recommendations_count": rec_count
+            }
+        except Exception as e:
+            return {
+                "status": "error",
+                "error": str(e)[:100]
+            }
+
+    def close(self):
+
+        self._save_model()
+        self.db.close()
+        print(" TheraMuse closed successfully")
+
+
+class TheraMuseHTTPRequestHandler(BaseHTTPRequestHandler):
+    """Simple HTTP request handler for TheraMuse API"""
+
+    def __init__(self, *args, theramuse_instance=None, **kwargs):
+        self.theramuse = theramuse_instance
+        super().__init__(*args, **kwargs)
+
+    def do_GET(self):
+        """Handle GET requests"""
+        if self.path == '/':
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html')
+            self.end_headers()
+            response = """
+            <html>
+            <head><title>TheraMuse Backend</title></head>
+            <body>
+                <h1>TheraMuse Backend Server</h1>
+                <p>Music therapy recommendation system is running!</p>
+                <p>Available endpoints:</p>
+                <ul>
+                    <li>GET / - Status page</li>
+                    <li>GET /health - Health check</li>
+                </ul>
+            </body>
+            </html>
+            """
+            self.wfile.write(response.encode('utf-8'))
+
+        elif self.path == '/health':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            health_data = {
+                "status": "healthy",
+                "service": "TheraMuse Backend",
+                "timestamp": datetime.now().isoformat()
+            }
+            self.wfile.write(json.dumps(health_data).encode('utf-8'))
+
+        else:
+            self.send_response(404)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            error_response = {"error": "Endpoint not found"}
+            self.wfile.write(json.dumps(error_response).encode('utf-8'))
+
+    def do_POST(self):
+        """Handle POST requests"""
+        content_length = int(self.headers['Content-Length'])
+        post_data = self.rfile.read(content_length)
+
+        try:
+            data = json.loads(post_data.decode('utf-8'))
+        except json.JSONDecodeError:
+            self.send_response(400)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            error_response = {"error": "Invalid JSON"}
+            self.wfile.write(json.dumps(error_response).encode('utf-8'))
+            return
+
+        if self.path == '/recommend' and self.theramuse:
+            try:
+                patient_data = data.get('patient', {})
+                therapy_type = data.get('therapy_type', 'dementia')
+                patient_id = data.get('patient_id', 'unknown')
+
+                recommendations = self.theramuse.get_therapy_recommendations(
+                    patient_data, therapy_type, patient_id
+                )
+
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                response_data = make_json_safe(recommendations)
+                self.wfile.write(json.dumps(response_data).encode('utf-8'))
+
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                error_response = {"error": f"Internal server error: {str(e)}"}
+                self.wfile.write(json.dumps(error_response).encode('utf-8'))
+        else:
+            self.send_response(404)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            error_response = {"error": "Endpoint not found"}
+            self.wfile.write(json.dumps(error_response).encode('utf-8'))
+
+    def log_message(self, format, *args):
+        """Custom log messages"""
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {format %args}")
+
+
+def run_server(host='localhost', port=8000, theramuse_instance=None):
+    """Run the HTTP server on specified host and port"""
+    handler = lambda *args, **kwargs: TheraMuseHTTPRequestHandler(*args, theramuse_instance=theramuse_instance, **kwargs)
+
+    server = HTTPServer((host, port), handler)
+    print(f"🚀 TheraMuse server starting on http://{host}:{port}")
+    print(f"   Access the API at http://{host}:{port}")
+    print(f"   Health check: http://{host}:{port}/health")
+    print("   Press Ctrl+C to stop the server")
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n⏹️  Server is shutting down...")
+        server.shutdown()
+        print("✅ Server stopped successfully")
+
+
+if __name__ == "__main__":
+
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='TheraMuse Music Therapy Backend')
+    parser.add_argument('--host', default='localhost', help='Host to bind the server to (default: localhost)')
+    parser.add_argument('--port', type=int, default=8000, help='Port to bind the server to (default: 8000)')
+    parser.add_argument('--test', action='store_true', help='Run therapy function tests instead of starting server')
+
+    args = parser.parse_args()
+
+    # Initialize TheraMuse instance
+    theramuse = TheraMuse()
+
+    # Run tests if requested
+    if args.test:
+        print(" Testing TheraMuse Therapy Functions...")
+
+        print("\n" + "="*50)
+        print("TESTING DEMENTIA THERAPY")
+        print("="*50)
+
+        dementia_patient = {
+            "name": "Test Dementia Patient",
+            "age": 75,
+            "birth_year": 1948,
+            "birthplace_country": "Bangladesh",
+            "birthplace_city": "Dhaka",
+            "instruments": ["Piano", "Guitar"],
+            "favorite_season": "winter",
+            "natural_elements": ["Rain", "Forest"],
+            "difficulty_sleeping": True,
+            "trouble_remembering": True,
+            "big5_scores": {"openness": 4, "conscientiousness": 5, "extraversion": 3, "agreeableness": 6, "neuroticism": 2}
+        }
+
+        dementia_recs = theramuse.get_therapy_recommendations(dementia_patient, "dementia", "test_dementia")
+        print(f"Dementia recommendations: {dementia_recs['total_songs']} songs")
+
+
+        print("\n" + "="*50)
+        print("TESTING DOWN SYNDROME THERAPY")
+        print("="*50)
+
+        down_syndrome_recs = theramuse.get_therapy_recommendations({"name": "Test Child"}, "down_syndrome", "test_down_syndrome")
+        print(f"Down Syndrome recommendations: {down_syndrome_recs['total_songs']} songs")
+
+
+        print("\n" + "="*50)
+        print("TESTING ADHD THERAPY")
+        print("="*50)
+
+        adhd_recs = theramuse.get_therapy_recommendations({"name": "Test ADHD"}, "adhd", "test_adhd")
+        print(f"ADHD recommendations: {adhd_recs['total_songs']} songs")
+
+
+        if dementia_recs["categories"]:
+            first_category = list(dementia_recs["categories"].keys())[0]
+            songs = dementia_recs["categories"][first_category]["songs"]
+            if songs:
+                test_song = songs[0]
+                theramuse.record_feedback(
+                    "test_dementia", dementia_recs["session_id"],
+                    "dementia", test_song, "like", dementia_patient
+                )
+
+        theramuse.close()
+        print("\n All therapy functions tested successfully!")
+    else:
+        # Run server mode
+        print("🎵 Starting TheraMuse Backend Server...")
+        print(f"   Host: {args.host}")
+        print(f"   Port: {args.port}")
+        print("   Mode: Server")
+        print()
+
+        try:
+            run_server(host=args.host, port=args.port, theramuse_instance=theramuse)
+        except KeyboardInterrupt:
+            print("\n⏹️  Shutting down server...")
+        except Exception as e:
+            print(f"\n❌ Server error: {e}")
+        finally:
+            theramuse.close()
