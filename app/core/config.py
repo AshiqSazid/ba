@@ -37,6 +37,7 @@ class Settings(BaseSettings):
 
     # CORS
     BACKEND_CORS_ORIGINS: List[str] = [
+        "https://f-1-u01e.onrender.com",
         "http://localhost:3000",
         "http://localhost:3001",
         "http://127.0.0.1:3000",
