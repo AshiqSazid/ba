@@ -37,6 +37,7 @@ class Settings(BaseSettings):
 
     # CORS
     BACKEND_CORS_ORIGINS: List[str] = [
+        "https://f-9gz1.vercel.app", 
         "https://ba-beryl.vercel.app",
         "http://localhost:3000",
         "http://localhost:3001",
