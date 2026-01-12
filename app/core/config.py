@@ -37,11 +37,7 @@ class Settings(BaseSettings):
 
     # CORS
     BACKEND_CORS_ORIGINS: List[str] = [
-<<<<<<< HEAD
-        "https://backend-thera.onrender.com",
-=======
         "https://f-1-u01e.onrender.com",
->>>>>>> 0e2ee54 (fix)
         "http://localhost:3000",
         "http://localhost:3001",
         "http://127.0.0.1:3000",
