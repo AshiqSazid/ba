@@ -1,17 +1,9 @@
-from typing import Optional, List
+from typing import Optional, List, Union
 from urllib.parse import quote_plus
 from pydantic_settings import BaseSettings
 from pydantic import AnyHttpUrl, validator
-import os
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origin_regex=r"https://.*\.vercel\.app",
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 
 class Settings(BaseSettings):
@@ -27,14 +19,12 @@ class Settings(BaseSettings):
 
     # Database - PostgreSQL Only
     DATABASE_URL: Optional[str] = None
-    # PostgreSQL Configuration
     DB_HOST: str = "moodsinger-mlm-postgressql.postgres.database.azure.com"
     DB_PORT: int = 5432
     DB_USER: str = "moodroot"
     DB_PASSWORD: str = "a6amvy76wM7mA-$"
     DB_NAME: str = "theramuse_backend"
 
-  
     # ML Model
     MODEL_PATH: str = "theramuse_model.pkl"
     MUSIC_CATALOG_PATH: str = "./data/d.xlsx"
@@ -46,22 +36,25 @@ class Settings(BaseSettings):
 
     # CORS
     BACKEND_CORS_ORIGINS: List[str] = [
-        "https://f-9gz1.vercel.app", 
+        "https://f-9gz1.vercel.app",
         "https://ba-beryl.vercel.app",
         "http://localhost:3000",
         "http://localhost:3001",
         "http://127.0.0.1:3000",
-        "http://localhost:8000"
+        "http://localhost:8000",
     ]
 
     @validator("BACKEND_CORS_ORIGINS", pre=True)
     def assemble_cors_origins(cls, v):
-        if isinstance(v, str) and not v.startswith("["):
-            return [i.strip() for i in v.split(",")]
-        elif isinstance(v, list):
-            return v
-        elif isinstance(v, str) and v.startswith("["):
-            return v
+        # allow env var like: BACKEND_CORS_ORIGINS=https://a.com,https://b.com
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return []
+            if s.startswith("["):
+                # if you pass JSON-ish list in env, just return it (pydantic will parse)
+                return v
+            return [i.strip() for i in s.split(",") if i.strip()]
         return v
 
     # Logging
@@ -72,31 +65,23 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = "development"
     DEBUG: bool = True
 
-    @validator('DEBUG', pre=True)
+    @validator("DEBUG", pre=True)
     def parse_debug(cls, v):
         if isinstance(v, str):
-            return v.lower() in ('true', '1', 'yes', 'on')
+            return v.lower() in ("true", "1", "yes", "on")
         return v
-
-    # External Services
-    PYTHON_BINARY: str = "python"
-
-    # Rate Limiting
-    RATE_LIMIT_PER_MINUTE: int = 60
 
     @validator("DATABASE_URL", pre=True)
     def assemble_database_url(cls, v, values):
-        if v and isinstance(v, str) and v.strip():
-            return v
+        if isinstance(v, str) and v.strip():
+            return v.strip()
 
-        # PostgreSQL Configuration
         user = values.get("DB_USER", "moodroot")
-        password = quote_plus(values.get("DB_PASSWORD", "a6amvy76wM7mA-$"))
-        host = values.get("DB_HOST", "moodsinger-mlm-postgressql.postgres.database.azure.com")
+        password = quote_plus(values.get("DB_PASSWORD", ""))
+        host = values.get("DB_HOST", "")
         port = values.get("DB_PORT", 5432)
-        db_name = values.get("DB_NAME", "theramuse_backend")
+        db_name = values.get("DB_NAME", "")
 
-        # Use clean connection string with only essential parameters
         return f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{db_name}?sslmode=require"
 
     class Config:
@@ -105,3 +90,14 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+app = FastAPI(title=settings.PROJECT_NAME, version=settings.VERSION)
+
+# ✅ Correct CORS (works with credentials)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.BACKEND_CORS_ORIGINS,  # <-- explicit list
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
