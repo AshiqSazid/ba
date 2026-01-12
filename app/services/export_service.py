@@ -75,8 +75,35 @@ class ExportService:
         return text.encode("latin-1", errors="replace").decode("latin-1")
 
     def __init__(self):
-        self.export_dir = Path(settings.EXPORT_DIR)
-        self.export_dir.mkdir(exist_ok=True)
+        self.export_dir = self._resolve_export_dir()
+
+    def _resolve_export_dir(self) -> Path:
+        configured = Path(settings.EXPORT_DIR)
+        candidates = [configured]
+        if not configured.is_absolute():
+            candidates.append(Path("/tmp") / configured)
+
+        for candidate in candidates:
+            try:
+                candidate.mkdir(parents=True, exist_ok=True)
+                return candidate
+            except OSError as exc:
+                logger.warning(
+                    "Failed to create export directory, trying fallback",
+                    path=str(candidate),
+                    error=str(exc),
+                )
+
+        fallback = Path("/tmp/exports")
+        try:
+            fallback.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.warning(
+                "Failed to create fallback export directory",
+                path=str(fallback),
+                error=str(exc),
+            )
+        return fallback
 
     def generate_pdf_report(self, patient_info: Dict[str, Any],
                           recommendations: List[TherapyRecommendation],
