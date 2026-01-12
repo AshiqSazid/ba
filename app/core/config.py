@@ -3,6 +3,15 @@ from urllib.parse import quote_plus
 from pydantic_settings import BaseSettings
 from pydantic import AnyHttpUrl, validator
 import os
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=r"https://.*\.vercel\.app",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 class Settings(BaseSettings):
