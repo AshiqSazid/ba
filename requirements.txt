@@ -15,7 +15,9 @@ python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
 python-dotenv==1.2.1
 
-httpx==0.28.1
+httpx==0.28.1venv) moodifai@moodifai-HP-EliteBook-850-G7-Notebook-PC:~/Music/Theramuse/backup/backend$ git status -sb
+## main...origin/main
+(venv) moodifai@moodifai-HP-EliteBook-850-G7-Notebook-PC:~/Music/Theramuse/backup/backend$ 
 requests==2.32.5
 
 numpy==2.4.1
